@@ -10,31 +10,74 @@ DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY")
 ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
+def number_to_words(val: int) -> str:
+    """Converts a number like 8500 into 'eight thousand five hundred'."""
+    units = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+    teens = ["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+    tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+    if val == 0:
+        return "zero"
+
+    def two_digits(n):
+        if n < 10:
+            return units[n]
+        elif 10 <= n < 20:
+            return teens[n - 10]
+        else:
+            return tens[n // 10] + ("-" + units[n % 10] if n % 10 != 0 else "")
+
+    def three_digits(n):
+        res = ""
+        if n >= 100:
+            res += units[n // 100] + " hundred"
+            n %= 100
+            if n > 0:
+                res += " and "
+        if n > 0:
+            res += two_digits(n)
+        return res
+
+    temp = val
+    parts = []
+    if temp >= 1000000:
+        parts.append(three_digits(temp // 1000000) + " million")
+        temp %= 1000000
+    if temp >= 1000:
+        parts.append(three_digits(temp // 1000) + " thousand")
+        temp %= 1000
+    if temp > 0:
+        parts.append(three_digits(temp))
+
+    return " ".join(parts).strip()
+
+def _price_words_replacer(match):
+    num_str = match.group(1).replace(",", "")
+    try:
+        val = int(float(num_str))
+        words = number_to_words(val)
+        return f"{words} Naira"
+    except Exception:
+        return match.group(0)
+
 def clean_text_for_speech(text: str) -> str:
     """
-    Guarantees that prices like N3,000, N 3,500, ₦68,000 are converted 
-    to '3,000 Naira' so ElevenLabs NEVER pronounces the letter 'N' or 'En'.
+    Cleans text and expands numbers to spoken words so 8,500 is read as
+    'eight thousand five hundred Naira' (never 'eighty-five hundred').
     """
-    # 1. Clean HTML entities
-    text = text.replace("&#8358;", " Naira ")
-    text = text.replace("&amp;", " and ")
+    text = text.replace("&#8358;", " Naira ").replace("&amp;", " and ")
 
-    # 2. Catch N3000, N 3,500, ₦68000, NGN 5000 and turn into '3,000 Naira'
+    # 1. Normalize currency symbols: N3000, ₦68,000 -> 3000 Naira
     text = re.sub(r'(?i)(?<![a-z])(?:[₦\u20a6]|NGN|N)\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)', r'\1 Naira', text)
-
-    # 3. Clean any leftover symbols
     text = text.replace('₦', ' Naira ').replace('\u20a6', ' Naira ')
 
-    # 4. Remove markdown links [Text](http...) -> Text
+    # 2. Expand prices like '8,500 Naira' to 'eight thousand five hundred Naira'
+    text = re.sub(r'([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)\s*Naira', _price_words_replacer, text, flags=re.IGNORECASE)
+
+    # 3. Clean markdown and symbols
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-
-    # 5. Remove markdown symbols (*, _, ~, #, `)
     text = re.sub(r'[*_~`#]', '', text)
-
-    # 6. Remove emojis
     text = re.sub(r'[^\w\s,.\?!;:/\-]', '', text)
-
-    # 7. Normalize spaces
     return re.sub(r'\s+', ' ', text).strip()
 
 def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> dict:
@@ -42,11 +85,27 @@ def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
     if not DEEPGRAM_KEY:
         return {"success": False, "error": "DEEPGRAM_API_KEY missing"}
 
-    context_prompt = urllib.parse.quote("Malltiple is a Nigerian online shopping marketplace in Lagos selling groceries, soya oil, oats, and electronics in Naira.")
-    keywords = "keywords=Malltiple:4&keywords=Naira:3&keywords=Soya:3&keywords=Quaker:3&keywords=Pringles:3"
+    context = (
+        "Malltiple Nigerian online shopping marketplace in Lagos and Abuja. "
+        "Customer inquiries about groceries, prices, soya oil, quaker oats, custard, "
+        "pringles, biscuits, delivery, and orders in Naira."
+    )
+    context_prompt = urllib.parse.quote(context)
 
-    endpoint = f"https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&language=en&prompt={context_prompt}&{keywords}"
-    headers = {"Authorization": f"Token {DEEPGRAM_KEY}", "Content-Type": mime_type}
+    boosted_keywords = [
+        "Malltiple:5", "Naira:4", "Soya:4", "Quaker:4", "Oats:4", "Pringles:4",
+        "Custard:3", "Lagos:3", "Abuja:3", "Indomie:3", "Paystack:3", "keg:3",
+        "pouch:3", "carton:3", "dispatch:3", "delivery:3", "how much:3"
+    ]
+    keywords_param = "&".join([f"keywords={kw}" for kw in boosted_keywords])
+
+    endpoint = (
+        f"https://api.deepgram.com/v1/listen?"
+        f"model=nova-2&smart_format=true&punctuate=true&language=en&"
+        f"prompt={context_prompt}&{keywords_param}"
+    )
+
+    headers = {"Authorization": f"Token {DEEPGRAM_KEY}", "Content-Type": "audio/ogg"}
 
     try:
         response = requests.post(endpoint, headers=headers, data=audio_bytes, timeout=10)
@@ -59,7 +118,7 @@ def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
         return {"success": False, "error": str(e)}
 
 def text_to_speech_bytes(text: str, voice_id: str = None) -> bytes:
-    """Converts cleaned text to audio using ElevenLabs."""
+    """Converts cleaned text to natural human speech using ElevenLabs."""
     if not ELEVENLABS_KEY:
         raise ValueError("ELEVENLABS_API_KEY is missing in .env")
 
