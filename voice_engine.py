@@ -1,5 +1,6 @@
 import os
 import re
+import urllib.parse
 import requests
 from dotenv import load_dotenv
 
@@ -7,55 +8,64 @@ load_dotenv()
 
 DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY")
 ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
-
 DEFAULT_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
 
 def clean_text_for_speech(text: str) -> str:
     """
-    Cleans markdown, emojis, links, and converts ₦ symbol to 'Naira' 
-    so ElevenLabs pronounces it perfectly.
+    Completely eliminates the ₦ symbol and replaces it with 'Naira'
+    to prevent ElevenLabs from saying 'naira sign one'.
     """
-    # 1. Convert ₦500 or ₦ 500 to '500 Naira'
-    text = re.sub(r'₦\s*([0-9,]+(\.[0-9]{2})?)', r'\1 Naira', text)
-    text = text.replace("₦", " Naira ")
+    # 1. Replace HTML entities
+    text = text.replace("&#8358;", " Naira ")
+    text = text.replace("&amp;", " and ")
 
-    # 2. Convert markdown links [Text](http://...) to just 'Text'
+    # 2. Replace Unicode Naira symbols (\u20a6 and ₦) followed by numbers
+    text = re.sub(r'[\u20a6₦]\s*([0-9,]+(\.[0-9]{2})?)', r'\1 Naira', text)
+    text = text.replace('\u20a6', ' Naira ')
+    text = text.replace('₦', ' Naira ')
+
+    # 3. Replace NGN or standalone N before prices
+    text = re.sub(r'\bNGN\s*([0-9,]+)', r'\1 Naira', text, flags=re.IGNORECASE)
+
+    # 4. Convert markdown links [Text](http...) to just Text
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
 
-    # 3. Strip bold/italic markdown (*, _, ~)
+    # 5. Remove markdown formatting (*, _, ~, #, `)
     text = re.sub(r'[*_~`#]', '', text)
 
-    # 4. Strip common emojis
-    text = re.sub(r'[^\w\s,.\?!;:/\-₦]', '', text)
+    # 6. Remove emojis and unusual punctuation
+    text = re.sub(r'[^\w\s,.\?!;:/\-]', '', text)
 
-    # 5. Clean up extra spaces
+    # 7. Normalize spaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> dict:
     """
-    Sends audio to Deepgram Nova-2 with Nigerian context priming and keyword boosting.
+    Transcribes audio with Deepgram Nova-2 using contextual priming and Nigerian retail keywords.
     """
     if not DEEPGRAM_KEY:
         return {"success": False, "error": "DEEPGRAM_API_KEY missing"}
 
-    # Boost recognition for Malltiple terms & Nigerian context
+    # Context prompt teaches Deepgram what kind of speech to expect
+    context_prompt = urllib.parse.quote("Malltiple is a Nigerian online e-commerce store in Lagos selling groceries, soya oil, oats, and electronics in Naira.")
+    
+    # Priority keywords
     keywords = [
-        "Malltiple:3",
+        "Malltiple:4",
         "Naira:3",
-        "Soya:2",
-        "Quaker:2",
-        "Pringles:2",
-        "Custard:2",
+        "Soya:3",
+        "Quaker:3",
+        "Pringles:3",
+        "Custard:3",
         "Lagos:2",
-        "Abuja:2",
-        "Paystack:2"
+        "Abuja:2"
     ]
     keywords_param = "&".join([f"keywords={kw}" for kw in keywords])
 
     endpoint = (
         f"https://api.deepgram.com/v1/listen?"
-        f"model=nova-2&smart_format=true&punctuate=true&{keywords_param}"
+        f"model=nova-2&smart_format=true&punctuate=true&language=en&prompt={context_prompt}&{keywords_param}"
     )
 
     headers = {
@@ -75,12 +85,12 @@ def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
 
 def text_to_speech_bytes(text: str, voice_id: str = DEFAULT_VOICE_ID) -> bytes:
     """
-    Converts sanitized text to an MP3 audio buffer using ElevenLabs Flash v2.5.
+    Converts cleaned text to audio using ElevenLabs Flash v2.5.
     """
     if not ELEVENLABS_KEY:
         raise ValueError("ELEVENLABS_API_KEY is missing in .env")
 
-    # Clean the text so ElevenLabs speaks 'Naira' properly
+    # Scrub text completely
     spoken_text = clean_text_for_speech(text)
 
     endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
