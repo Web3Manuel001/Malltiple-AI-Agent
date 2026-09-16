@@ -8,70 +8,45 @@ load_dotenv()
 
 DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY")
 ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
-DEFAULT_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
+VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
 def clean_text_for_speech(text: str) -> str:
     """
-    Catches all variations: N3000, N 3,500, ₦68,000, NGN 5000
-    and converts them to '[Amount] Naira' so ElevenLabs never says 'En' or 'Naira sign'.
+    Guarantees that prices like N3,000, N 3,500, ₦68,000 are converted 
+    to '3,000 Naira' so ElevenLabs NEVER pronounces the letter 'N' or 'En'.
     """
     # 1. Clean HTML entities
     text = text.replace("&#8358;", " Naira ")
     text = text.replace("&amp;", " and ")
 
-    # 2. Match N, ₦, or NGN followed by numbers (e.g. N3,500, N 3500, ₦68,000, NGN 5000)
-    # Notice: (?<![A-Za-z]) ensures words like 'Need' or 'Nine' are NOT affected!
-    currency_pattern = r'(?<![A-Za-z])(?:[₦\u20a6]|NGN|N)\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)'
-    text = re.sub(currency_pattern, r'\1 Naira', text, flags=re.IGNORECASE)
+    # 2. Catch N3000, N 3,500, ₦68000, NGN 5000 and turn into '3,000 Naira'
+    text = re.sub(r'(?i)(?<![a-z])(?:[₦\u20a6]|NGN|N)\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)', r'\1 Naira', text)
 
-    # 3. Clean any leftover standalone currency symbols
+    # 3. Clean any leftover symbols
     text = text.replace('₦', ' Naira ').replace('\u20a6', ' Naira ')
 
-    # 4. Convert markdown links [Text](http...) to just Text
+    # 4. Remove markdown links [Text](http...) -> Text
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
 
-    # 5. Remove markdown formatting (*, _, ~, #, `)
+    # 5. Remove markdown symbols (*, _, ~, #, `)
     text = re.sub(r'[*_~`#]', '', text)
 
-    # 6. Remove emojis and unusual punctuation
+    # 6. Remove emojis
     text = re.sub(r'[^\w\s,.\?!;:/\-]', '', text)
 
     # 7. Normalize spaces
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    return re.sub(r'\s+', ' ', text).strip()
 
 def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> dict:
-    """
-    Transcribes audio with Deepgram Nova-2 using contextual priming and Nigerian retail keywords.
-    """
+    """Sends audio to Deepgram Nova-2 with Nigerian retail keywords."""
     if not DEEPGRAM_KEY:
         return {"success": False, "error": "DEEPGRAM_API_KEY missing"}
 
-    # Context prompt teaches Deepgram what kind of speech to expect
-    context_prompt = urllib.parse.quote("Malltiple is a Nigerian online e-commerce store in Lagos selling groceries, soya oil, oats, and electronics in Naira.")
-    
-    # Priority keywords
-    keywords = [
-        "Malltiple:4",
-        "Naira:3",
-        "Soya:3",
-        "Quaker:3",
-        "Pringles:3",
-        "Custard:3",
-        "Lagos:2",
-        "Abuja:2"
-    ]
-    keywords_param = "&".join([f"keywords={kw}" for kw in keywords])
+    context_prompt = urllib.parse.quote("Malltiple is a Nigerian online shopping marketplace in Lagos selling groceries, soya oil, oats, and electronics in Naira.")
+    keywords = "keywords=Malltiple:4&keywords=Naira:3&keywords=Soya:3&keywords=Quaker:3&keywords=Pringles:3"
 
-    endpoint = (
-        f"https://api.deepgram.com/v1/listen?"
-        f"model=nova-2&smart_format=true&punctuate=true&language=en&prompt={context_prompt}&{keywords_param}"
-    )
-
-    headers = {
-        "Authorization": f"Token {DEEPGRAM_KEY}",
-        "Content-Type": mime_type
-    }
+    endpoint = f"https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&language=en&prompt={context_prompt}&{keywords}"
+    headers = {"Authorization": f"Token {DEEPGRAM_KEY}", "Content-Type": mime_type}
 
     try:
         response = requests.post(endpoint, headers=headers, data=audio_bytes, timeout=10)
@@ -79,25 +54,19 @@ def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
             data = response.json()
             transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
             return {"success": True, "text": transcript.strip()}
-        return {"success": False, "error": f"Deepgram status {response.status_code}: {response.text}"}
+        return {"success": False, "error": f"Deepgram status {response.status_code}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 def text_to_speech_bytes(text: str, voice_id: str = None) -> bytes:
-    """
-    Converts text to natural human speech using an authentic Nigerian voice 
-    and ElevenLabs Multilingual v2 engine.
-    """
+    """Converts cleaned text to audio using ElevenLabs."""
     if not ELEVENLABS_KEY:
         raise ValueError("ELEVENLABS_API_KEY is missing in .env")
 
-    # Use Voice ID from .env, or fallback
-    active_voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID", DEFAULT_VOICE_ID)
-
-    # Clean text to ensure smooth reading
+    active_voice = voice_id or VOICE_ID
     spoken_text = clean_text_for_speech(text)
 
-    endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{active_voice_id}"
+    endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{active_voice}"
     headers = {
         "xi-api-key": ELEVENLABS_KEY,
         "Content-Type": "application/json",
@@ -106,13 +75,11 @@ def text_to_speech_bytes(text: str, voice_id: str = None) -> bytes:
 
     payload = {
         "text": spoken_text,
-        # Multilingual v2 has maximum emotional range and native accent handling
         "model_id": "eleven_multilingual_v2",
         "voice_settings": {
-            "stability": 0.45,         # Lower stability = more human expression/inflection
-            "similarity_boost": 0.85,  # Higher similarity = locks tightly onto the Nigerian accent
-            "style": 0.20,             # Adds conversational warmth
-            "use_speaker_boost": True
+            "stability": 0.45,
+            "similarity_boost": 0.85,
+            "style": 0.20
         }
     }
 
