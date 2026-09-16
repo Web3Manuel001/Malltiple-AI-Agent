@@ -1,0 +1,18 @@
+# Secrets
+.env
+
+# Virtual Environment
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local SQLite Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
