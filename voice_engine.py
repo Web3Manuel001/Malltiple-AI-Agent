@@ -83,17 +83,21 @@ def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def text_to_speech_bytes(text: str, voice_id: str = DEFAULT_VOICE_ID) -> bytes:
+def text_to_speech_bytes(text: str, voice_id: str = None) -> bytes:
     """
-    Converts cleaned text to audio using ElevenLabs Flash v2.5.
+    Converts text to natural human speech using an authentic Nigerian voice 
+    and ElevenLabs Multilingual v2 engine.
     """
     if not ELEVENLABS_KEY:
         raise ValueError("ELEVENLABS_API_KEY is missing in .env")
 
-    # Scrub text completely
+    # Use Voice ID from .env, or fallback
+    active_voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID", DEFAULT_VOICE_ID)
+
+    # Clean text to ensure smooth reading
     spoken_text = clean_text_for_speech(text)
 
-    endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{active_voice_id}"
     headers = {
         "xi-api-key": ELEVENLABS_KEY,
         "Content-Type": "application/json",
@@ -102,10 +106,13 @@ def text_to_speech_bytes(text: str, voice_id: str = DEFAULT_VOICE_ID) -> bytes:
 
     payload = {
         "text": spoken_text,
-        "model_id": "eleven_flash_v2_5",
+        # Multilingual v2 has maximum emotional range and native accent handling
+        "model_id": "eleven_multilingual_v2",
         "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75
+            "stability": 0.45,         # Lower stability = more human expression/inflection
+            "similarity_boost": 0.85,  # Higher similarity = locks tightly onto the Nigerian accent
+            "style": 0.20,             # Adds conversational warmth
+            "use_speaker_boost": True
         }
     }
 
