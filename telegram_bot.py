@@ -4,7 +4,8 @@ import logging
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
+import asyncio
+from aiohttp import web
 from groq import Groq
 from woo_tools import search_products, get_order_status, get_categories
 from memory import (
@@ -363,6 +364,20 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Welcome to Malltiple Assistant! I can help you search products, check prices, and track orders. What are you looking for today?"
     )
 
+async def health_check(request):
+    return web.Response(text="Malltiple Bot is running healthy!")
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Health check web server running on port {port}")
+
 if __name__ == "__main__":
     print("🚀 Malltiple Multi-Agent Support Desk is starting...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -374,5 +389,15 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("resolve", resolve_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_customer_message))
 
-    print("✅ System Online! Multi-Agent Dispatch & Admin Surveillance active.")
-    app.run_polling()
+    # Run both the web health server and the telegram polling
+    async def main():
+        await start_health_server()
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        print("✅ System Online! Listening for messages...")
+        # Keep running forever
+        while True:
+            await asyncio.sleep(3600)
+
+    asyncio.run(main())
