@@ -21,33 +21,46 @@ def _get_auth_params(extra_params=None):
 
 def search_products(query: str, per_page: int = 4) -> dict:
     """
-    Search live products in the Malltiple WooCommerce store.
+    Smart product search with automatic keyword trimming and fuzzy fallback.
     """
+    clean_query = query.strip()
     endpoint = f"{STORE_URL}/wp-json/wc/v3/products"
-    params = _get_auth_params({"search": query, "per_page": per_page})
+
+    # Attempt 1: Direct Search
+    params = _get_auth_params({"search": clean_query, "per_page": per_page})
 
     try:
         response = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
-        if response.status_code == 200:
-            products = response.json()
-            if not products:
-                return {"found": False, "message": f"No products found matching '{query}'."}
-            
-            clean_results = []
-            for item in products:
-                clean_results.append({
-                    "id": item.get("id"),
-                    "name": item.get("name"),
-                    "price_naira": item.get("price"),
-                    "in_stock": item.get("stock_status") == "instock",
-                    "permalink": item.get("permalink")
-                })
-            return {"found": True, "count": len(clean_results), "products": clean_results}
-        else:
-            return {"error": f"Store returned status code {response.status_code}"}
-    except Exception as e:
-        return {"error": f"Failed to search products: {str(e)}"}
+        products = response.json() if response.status_code == 200 else []
 
+        # Attempt 2 (Fuzzy Fallback): If 0 results and query has multiple words,
+        # try searching with the primary keyword (first word or longest word)
+        if not products and len(clean_query.split()) > 1:
+            words = [w for w in clean_query.split() if len(w) > 2]
+            if words:
+                fallback_keyword = words[0]  # E.g. from "Quaker Olds" -> try "Quaker"
+                print(f"🔄 [Fuzzy Fallback] Retrying search with root keyword: '{fallback_keyword}'...")
+                params = _get_auth_params({"search": fallback_keyword, "per_page": per_page})
+                fallback_res = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
+                if fallback_res.status_code == 200:
+                    products = fallback_res.json()
+
+        if not products:
+            return {"found": False, "message": f"No products found matching '{clean_query}'."}
+
+        clean_results = []
+        for item in products:
+            clean_results.append({
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "price_naira": item.get("price"),
+                "in_stock": item.get("stock_status") == "instock",
+                "permalink": item.get("permalink")
+            })
+        return {"found": True, "count": len(clean_results), "products": clean_results}
+
+    except Exception as e:
+        return {"error": f"Product search error: {str(e)}"}
 def get_order_status(order_id: int) -> dict:
     """
     Fetch the current status, total, and shipping notes of a specific order.

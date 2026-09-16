@@ -25,15 +25,26 @@ def clean_text_for_speech(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> dict:
-    """Deepgram Nova-2 transcription for listening."""
+    """
+    Optimized Deepgram Nova-2 with numerals parsing and clean acoustics.
+    """
     if not DEEPGRAM_KEY:
         return {"success": False, "error": "DEEPGRAM_API_KEY missing"}
 
-    endpoint = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&language=en&keywords=Malltiple:2"
-    headers = {"Authorization": f"Token {DEEPGRAM_KEY}", "Content-Type": mime_type}
+    # numerals=true ensures order numbers and prices are parsed as digits
+    endpoint = (
+        "https://api.deepgram.com/v1/listen?"
+        "model=nova-2&smart_format=true&punctuate=true&numerals=true&language=en"
+        "&keywords=Malltiple:3&keywords=Naira:2&keywords=Soya:2&keywords=Quaker:2"
+    )
+
+    headers = {
+        "Authorization": f"Token {DEEPGRAM_KEY}",
+        "Content-Type": mime_type
+    }
 
     try:
-        response = requests.post(endpoint, headers=headers, data=audio_bytes, timeout=10)
+        response = requests.post(endpoint, headers=headers, data=audio_bytes, timeout=12)
         if response.status_code == 200:
             data = response.json()
             transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
