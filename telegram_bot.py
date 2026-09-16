@@ -7,6 +7,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 import asyncio
 from aiohttp import web
 from groq import Groq
+import io
+from voice_engine import transcribe_audio_bytes, text_to_speech_bytes
 from woo_tools import search_products, get_order_status, get_categories
 from memory import (
     get_customer, save_or_update_customer, log_message, 
@@ -103,23 +105,47 @@ def run_agent_turn(user_id: int, user_text: str, user_name: str):
     if session["escalated"]:
         return None, False, ""
 
+    # Keep only the last 6 messages to stay well within token limits
+    if len(session["history"]) > 6:
+        session["history"] = session["history"][-6:]
+
     session["history"].append({"role": "user", "content": user_text})
     escalated_flag = False
     escalation_reason = ""
 
+    # Working copy of messages for this specific turn
+    messages_for_api = [{"role": "system", "content": SYSTEM_PROMPT}] + list(session["history"])
+
     while True:
-        response = client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + session["history"],
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.2,
-            max_tokens=500
-        )
+        try:
+            response = client.chat.completions.create(
+                model="qwen/qwen3.8-27b",
+                messages=messages_for_api,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.2,
+                max_tokens=300
+            )
+        except Exception as api_err:
+            print(f"❌ Groq API Error: {api_err}")
+            return "Sorry, I had a temporary glitch checking the store. Could you repeat that?", False, ""
 
         resp_msg = response.choices[0].message
         if resp_msg.tool_calls:
-            session["history"].append(resp_msg)
+            # Append assistant message with tool calls
+            messages_for_api.append({
+                "role": "assistant",
+                "content": resp_msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                    }
+                    for tc in resp_msg.tool_calls
+                ]
+            })
+
             for call in resp_msg.tool_calls:
                 fn_name = call.function.name
                 args = json.loads(call.function.arguments)
@@ -141,7 +167,7 @@ def run_agent_turn(user_id: int, user_text: str, user_name: str):
                 else:
                     result = {"error": "Unknown tool"}
 
-                session["history"].append({
+                messages_for_api.append({
                     "role": "tool",
                     "tool_call_id": tool_id,
                     "name": fn_name,
@@ -149,10 +175,10 @@ def run_agent_turn(user_id: int, user_text: str, user_name: str):
                 })
             continue
         else:
-            bot_text = resp_msg.content
+            bot_text = resp_msg.content or ""
+            # Save clean final assistant text into persistent session history
             session["history"].append({"role": "assistant", "content": bot_text})
             return bot_text, escalated_flag, escalation_reason
-
 # --- COMMAND HANDLERS ---
 
 async def add_agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -288,6 +314,101 @@ async def resolve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="🤝 Your inquiry has been marked as resolved by our team. Our AI assistant is here if you need anything else!"
         )
 
+async def handle_customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles incoming audio voice notes from customers."""
+    user = update.effective_user
+    user_id = user.id
+    user_name = user.full_name or user.username or "Customer"
+
+    # Show 'recording voice' indicator on Telegram
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
+
+    try:
+        # 1. Download voice note bytes directly into memory
+        voice_file = await context.bot.get_file(update.message.voice.file_id)
+        audio_bytearray = await voice_file.download_as_bytearray()
+        audio_bytes = bytes(audio_bytearray)
+
+        # 2. Transcribe with Deepgram Nova-2
+        stt_result = transcribe_audio_bytes(audio_bytes)
+        if not stt_result.get("success") or not stt_result.get("text"):
+            await update.message.reply_text("🎙️ I couldn't hear that clearly. Could you please speak closer to the mic or type it?")
+            return
+
+        transcribed_text = stt_result["text"]
+        print(f"\n🎤 [Voice Transcribed] {user_name}: \"{transcribed_text}\"")
+
+        # 3. Mirror transcription to Admin
+        if ADMIN_CHAT_ID and str(user_id) != str(ADMIN_CHAT_ID):
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"🎙️ *[VOICE INCOMING]* From: {user_name} (`{user_id}`)\nTranscript: \"_{transcribed_text}_\"",
+                parse_mode="Markdown"
+            )
+
+        # 4. Log customer message
+        log_message(user_id=str(user_id), sender="Customer (Voice)", text=transcribed_text, user_name=user_name)
+
+        # 5. Check if session is assigned to an agent
+        session = USER_SESSIONS.get(user_id)
+        if session and session.get("escalated"):
+            assigned = session.get("assigned_to")
+            if assigned:
+                await context.bot.send_message(
+                    chat_id=assigned["id"],
+                    text=f"🎙️ *[VOICE UPDATE]* From customer {user_name} (`{user_id}`):\n\"{transcribed_text}\"",
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text("⏳ A customer care agent has been notified and will reply shortly.")
+            return
+
+        # 6. Run AI Brain
+        bot_reply, was_escalated, reason = run_agent_turn(user_id, transcribed_text, user_name)
+
+        if bot_reply:
+            log_message(user_id=str(user_id), sender="Malltiple AI", text=bot_reply, user_name=user_name)
+
+            # 7. Convert AI reply to Voice with ElevenLabs
+            try:
+                tts_bytes = text_to_speech_bytes(bot_reply)
+                voice_io = io.BytesIO(tts_bytes)
+                voice_io.name = "reply.mp3"
+
+                # Reply with Voice Note AND text caption
+                await update.message.reply_voice(voice=voice_io, caption=bot_reply)
+            except Exception as tts_err:
+                print(f"TTS Fallback error: {tts_err}")
+                # If TTS fails or quota is low, fallback gracefully to text
+                await update.message.reply_text(bot_reply)
+
+            if ADMIN_CHAT_ID and str(user_id) != str(ADMIN_CHAT_ID):
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=f"🤖 *[AI VOICE REPLY]* To: {user_name} (`{user_id}`)\n{bot_reply}"
+                )
+
+        # Handle escalation if triggered by voice
+        if was_escalated:
+            alert = (
+                f"🚨 *URGENT ESCALATION VIA VOICE!*\n\n"
+                f"• Customer: {user_name} (`{user_id}`)\n"
+                f"• Reason: {reason}\n\n"
+                f"👉 Claim with: `/claim {user_id}`"
+            )
+            if ADMIN_CHAT_ID:
+                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=alert, parse_mode="Markdown")
+            for agent in get_all_active_agents():
+                if str(agent["id"]) != str(ADMIN_CHAT_ID):
+                    try:
+                        await context.bot.send_message(chat_id=agent["id"], text=alert, parse_mode="Markdown")
+                    except Exception:
+                        pass
+
+    except Exception as e:
+        print(f"Voice handling error: {e}")
+        await update.message.reply_text("⚠️ An error occurred processing your voice note. Please try again.")
+
 # --- CUSTOMER MESSAGE HANDLER ---
 
 async def handle_customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -388,6 +509,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("reply", reply_cmd))
     app.add_handler(CommandHandler("resolve", resolve_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_customer_message))
+    app.add_handler(CommandHandler("resolve", resolve_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_customer_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_customer_voice))
 
     # Run both the web health server and the telegram polling
     async def main():
