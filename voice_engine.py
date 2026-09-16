@@ -12,20 +12,20 @@ DEFAULT_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
 
 def clean_text_for_speech(text: str) -> str:
     """
-    Completely eliminates the ₦ symbol and replaces it with 'Naira'
-    to prevent ElevenLabs from saying 'naira sign one'.
+    Catches all variations: N3000, N 3,500, ₦68,000, NGN 5000
+    and converts them to '[Amount] Naira' so ElevenLabs never says 'En' or 'Naira sign'.
     """
-    # 1. Replace HTML entities
+    # 1. Clean HTML entities
     text = text.replace("&#8358;", " Naira ")
     text = text.replace("&amp;", " and ")
 
-    # 2. Replace Unicode Naira symbols (\u20a6 and ₦) followed by numbers
-    text = re.sub(r'[\u20a6₦]\s*([0-9,]+(\.[0-9]{2})?)', r'\1 Naira', text)
-    text = text.replace('\u20a6', ' Naira ')
-    text = text.replace('₦', ' Naira ')
+    # 2. Match N, ₦, or NGN followed by numbers (e.g. N3,500, N 3500, ₦68,000, NGN 5000)
+    # Notice: (?<![A-Za-z]) ensures words like 'Need' or 'Nine' are NOT affected!
+    currency_pattern = r'(?<![A-Za-z])(?:[₦\u20a6]|NGN|N)\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)'
+    text = re.sub(currency_pattern, r'\1 Naira', text, flags=re.IGNORECASE)
 
-    # 3. Replace NGN or standalone N before prices
-    text = re.sub(r'\bNGN\s*([0-9,]+)', r'\1 Naira', text, flags=re.IGNORECASE)
+    # 3. Clean any leftover standalone currency symbols
+    text = text.replace('₦', ' Naira ').replace('\u20a6', ' Naira ')
 
     # 4. Convert markdown links [Text](http...) to just Text
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
