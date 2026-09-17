@@ -18,10 +18,10 @@ def get_or_create_cart(customer_id: str) -> dict:
     db.close()
     return {"customer_id": str(customer_id), "items": items}
 
-def add_product_to_cart(customer_id: str, product_id: int, quantity: int = 1) -> dict:
+def add_product_to_cart(customer_id: str, product_id: int, quantity: int = 1, customer_phone: str = "") -> dict:
     pdata = get_product_by_id(product_id)
     if not pdata.get("found"):
-        return {"success": False, "error": f"Product #{product_id} not found in store."}
+        return {"success": False, "error": f"Product #{product_id} not found in catalog. Search for the item first to verify the ID."}
     if not pdata.get("in_stock"):
         return {"success": False, "error": f"{pdata['name']} is currently out of stock."}
 
@@ -33,7 +33,7 @@ def add_product_to_cart(customer_id: str, product_id: int, quantity: int = 1) ->
 
     items = json.loads(cart_entry.items_json)
 
-    # Check if item already in cart
+    # Check if item already exists in cart
     found = False
     for itm in items:
         if itm["product_id"] == product_id:
@@ -54,16 +54,16 @@ def add_product_to_cart(customer_id: str, product_id: int, quantity: int = 1) ->
     db.commit()
     db.close()
 
-    return view_customer_cart(customer_id)
+    return view_customer_cart(customer_id, customer_phone)
 
-def view_customer_cart(customer_id: str) -> dict:
+def view_customer_cart(customer_id: str, customer_phone: str = "") -> dict:
     cart_data = get_or_create_cart(customer_id)
     items = cart_data["items"]
 
     if not items:
         return {
             "empty": True,
-            "message": "Your cart is currently empty. Tell me what product you'd like to add!"
+            "message": "Your cart is currently empty. Tell me what products you want to add!"
         }
 
     total_naira = sum(item["unit_price"] * item["quantity"] for item in items)
@@ -72,17 +72,19 @@ def view_customer_cart(customer_id: str) -> dict:
         for item in items
     ]
 
-    # Primary checkout link (adds the first product directly to Malltiple cart)
+    # Direct Checkout URL that drops item directly into checkout and never 404s or empties
     primary_id = items[0]["product_id"]
     primary_qty = items[0]["quantity"]
-    cart_url = f"{settings.STORE_URL}/cart/?add-to-cart={primary_id}&quantity={primary_qty}"
+    
+    phone_param = f"&billing_phone={customer_phone}" if customer_phone else ""
+    checkout_url = f"{settings.STORE_URL}/checkout/?add-to-cart={primary_id}&quantity={primary_qty}{phone_param}"
 
     return {
         "empty": False,
         "items": item_lines,
         "total_naira": f"{total_naira:,.2f}",
-        "cart_url": cart_url,
-        "message": f"You have {len(items)} item(s) in your cart. Total: {total_naira:,.2f} Naira.\nCheckout link: {cart_url}"
+        "checkout_url": checkout_url,
+        "message": f"Cart items:\n" + "\n".join(item_lines) + f"\n\nTotal: {total_naira:,.2f} Naira.\n👉 Complete Checkout Here: {checkout_url}"
     }
 
 def clear_customer_cart(customer_id: str) -> dict:

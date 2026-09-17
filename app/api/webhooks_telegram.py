@@ -13,6 +13,7 @@ from app.core.database import SessionLocal
 from app.models.agent import Agent
 from app.models.ticket import TicketSession, CSATRating
 from app.models.audit import AuditLog
+from app.services.customer_service import get_or_create_customer
 from app.services.brain import execute_turn
 from app.services.supervisor import audit_human_agent_message
 from app.services.voice import transcribe_audio_bytes, text_to_speech_bytes
@@ -21,7 +22,6 @@ router = APIRouter()
 tg_app = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).build()
 USER_SESSIONS = {}
 
-# --- COMMANDS ---
 async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_id = str(update.effective_user.id)
     db = SessionLocal()
@@ -167,49 +167,61 @@ async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def customer_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
+    user_name = user.full_name or "Customer"
     text = update.message.text
     if text.startswith("/"): return
 
     db = SessionLocal()
-    db.add(AuditLog(user_id=str(user_id), user_name=user.full_name or "Customer", sender="Customer", message=text))
+    db.add(AuditLog(user_id=str(user_id), user_name=user_name, sender="Customer", message=text))
     db.commit()
+    db.close()
 
-    session = USER_SESSIONS.setdefault(user_id, {"history": [], "escalated": False, "assigned_to": None, "name": user.full_name or "Customer"})
+    # Retrieve customer identity from database
+    customer_profile = get_or_create_customer(str(user_id), user_name)
+
+    session = USER_SESSIONS.setdefault(user_id, {"history": [], "escalated": False, "assigned_to": None, "name": user_name})
     if session.get("escalated"):
         assigned = session.get("assigned_to")
         if assigned:
-            await context.bot.send_message(chat_id=assigned["id"], text=f"💬 *[Cust Update]* {user.full_name} (`{user_id}`):\n\"{text}\"", parse_mode="Markdown")
+            await context.bot.send_message(chat_id=assigned["id"], text=f"💬 *[Cust Update]* {user_name} (`{user_id}`):\n\"{text}\"", parse_mode="Markdown")
         else:
             await update.message.reply_text("⏳ An agent will respond shortly.")
-        db.close()
         return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     session["history"].append({"role": "user", "content": text})
-    reply, was_escalated, reason = execute_turn(str(user_id), session["history"])
+    
+    # Execute AI with full customer profile context!
+    reply, was_escalated, reason = execute_turn(str(user_id), customer_profile, session["history"])
 
     if reply:
         session["history"].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply)
-        db.add(AuditLog(user_id=str(user_id), user_name=user.full_name or "Customer", sender="Malltiple AI", message=reply))
+
+        db = SessionLocal()
+        db.add(AuditLog(user_id=str(user_id), user_name=user_name, sender="Malltiple AI", message=reply))
         db.commit()
+        db.close()
 
     if was_escalated:
         session["escalated"] = True
-        alert = f"🚨 *ESCALATION:*\n• Cust: {user.full_name} (`{user_id}`)\n• Reason: {reason}\n👉 Claim: `/claim {user_id}`"
+        alert = f"🚨 *ESCALATION:*\n• Cust: {user_name} (`{user_id}`)\n• Reason: {reason}\n👉 Claim: `/claim {user_id}`"
         if settings.ADMIN_CHAT_ID:
             await context.bot.send_message(chat_id=settings.ADMIN_CHAT_ID, text=alert, parse_mode="Markdown")
+        
+        db = SessionLocal()
         agents = db.query(Agent).filter(Agent.is_active == True).all()
         for a in agents:
             if str(a.telegram_id) != str(settings.ADMIN_CHAT_ID):
                 try: await context.bot.send_message(chat_id=a.telegram_id, text=alert, parse_mode="Markdown")
                 except: pass
-
-    db.close()
+        db.close()
 
 async def customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
+    user_name = user.full_name or "Customer"
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
     try:
         v_file = await context.bot.get_file(update.message.voice.file_id)
@@ -220,9 +232,11 @@ async def customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         text = stt["text"]
-        session = USER_SESSIONS.setdefault(user_id, {"history": [], "escalated": False, "assigned_to": None, "name": user.full_name or "Customer"})
+        customer_profile = get_or_create_customer(str(user_id), user_name)
+
+        session = USER_SESSIONS.setdefault(user_id, {"history": [], "escalated": False, "assigned_to": None, "name": user_name})
         session["history"].append({"role": "user", "content": text})
-        reply, was_esc, reason = execute_turn(str(user_id), session["history"])
+        reply, was_esc, reason = execute_turn(str(user_id), customer_profile, session["history"])
         if reply:
             session["history"].append({"role": "assistant", "content": reply})
             try:
@@ -235,7 +249,6 @@ async def customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Voice error: {e}")
 
-# Register Handlers
 tg_app.add_handler(CommandHandler("claim", claim_cmd))
 tg_app.add_handler(CommandHandler("reply", reply_cmd))
 tg_app.add_handler(CommandHandler("resolve", resolve_cmd))
@@ -243,12 +256,8 @@ tg_app.add_handler(CallbackQueryHandler(rating_callback))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, customer_msg))
 tg_app.add_handler(MessageHandler(filters.VOICE, customer_voice))
 
-# --- THE TELEGRAM WEBHOOK ENDPOINT ---
 @router.post("/api/telegram-webhook")
 async def telegram_webhook_handler(request: Request, background_tasks: BackgroundTasks):
-    """
-    Receives Telegram updates via HTTP POST. Zero polling loop, zero 409 conflicts.
-    """
     req_dict = await request.json()
     update = Update.de_json(data=req_dict, bot=tg_app.bot)
     background_tasks.add_task(tg_app.process_update, update)

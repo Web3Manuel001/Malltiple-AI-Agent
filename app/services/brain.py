@@ -3,6 +3,7 @@ from groq import Groq
 from app.core.config import settings
 from app.services.woocommerce import search_products, get_categories, track_order_live
 from app.services.cart_service import add_product_to_cart, view_customer_cart, clear_customer_cart
+from app.services.customer_service import link_customer_identity
 
 client = Groq(api_key=settings.GROQ_API_KEY)
 
@@ -11,7 +12,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_products",
-            "description": "Search products in catalog by 1-2 core keywords.",
+            "description": "Search products in catalog by 1-2 core keywords. ALWAYS call this first to get real product IDs.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Search keyword"}},
@@ -23,11 +24,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "add_to_cart",
-            "description": "Add a product to the customer's personal shopping cart.",
+            "description": "Add a product to the customer's personal shopping cart using its verified product_id.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "product_id": {"type": "integer", "description": "Numeric product ID"},
+                    "product_id": {"type": "integer", "description": "Numeric product ID from search_products"},
                     "quantity": {"type": "integer", "description": "Quantity to add", "default": 1}
                 },
                 "required": ["product_id"]
@@ -38,7 +39,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "view_cart",
-            "description": "View the customer's current shopping cart items, total in Naira, and checkout link.",
+            "description": "View current shopping cart items, total in Naira, and direct checkout link.",
             "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
@@ -48,6 +49,22 @@ TOOLS = [
             "name": "clear_cart",
             "description": "Clear all items from the customer's shopping cart.",
             "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_customer_details",
+            "description": "Remember the customer's name, phone, email, or delivery city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "phone": {"type": "string"},
+                    "email": {"type": "string"},
+                    "city": {"type": "string"}
+                }
+            }
         }
     },
     {
@@ -84,24 +101,35 @@ TOOLS = [
     }
 ]
 
-SYSTEM_PROMPT = """
-You are the official customer assistant for Malltiple (malltiple.com.ng), a Nigerian online marketplace.
-Help customers search products, manage their personal cart, and track orders.
+def build_system_prompt(customer_profile: dict) -> str:
+    cust_name = customer_profile.get("name") or "Valued Customer"
+    cust_phone = customer_profile.get("phone") or "Not provided"
+    cust_email = customer_profile.get("email") or "Not provided"
+    cust_city = customer_profile.get("city") or "Not provided"
 
-CART & SHOPPING WORKFLOW:
-- When customers search for items, use `search_products`.
-- When they want to add an item to their cart, call `add_to_cart` with the product_id and quantity.
-- When they ask "what is in my cart?" or "how much is my total?", call `view_cart`.
-- Provide the checkout link so they can complete payment securely on the Malltiple website.
+    return f"""
+You are the official shopping assistant for Malltiple (malltiple.com.ng), a Nigerian marketplace.
 
-RULES:
-- Never write 'N' or '₦' before numbers. Always write '11,500 Naira'.
-- If customer demands a human or reports a double debit/dispute, call `escalate_to_human`.
-- Keep answers short, friendly, and helpful.
+CURRENT CUSTOMER PROFILE:
+- Name: {cust_name}
+- Phone: {cust_phone}
+- Email: {cust_email}
+- Location: {cust_city}
+
+CRITICAL SHOPPING & CART RULES:
+1. ALWAYS call `search_products` first when a customer asks for an item so you have the real `product_id`. NEVER guess a product ID.
+2. When the customer wants to add an item to their cart, call `add_to_cart(product_id, quantity)`.
+3. If the customer mentions their name, phone, or email, call `save_customer_details` to link their profile.
+4. When showing cart totals, provide the checkout link so they can tap and pay securely on Malltiple.
+
+CURRENCY & TONE:
+- Write all prices in Naira (e.g. '11,500 Naira', never 'N11,500').
+- If customer demands a human or reports a double debit, call `escalate_to_human`.
 """
 
-def execute_turn(customer_id: str, history: list) -> tuple:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-6:]
+def execute_turn(telegram_id: str, customer_profile: dict, history: list) -> tuple:
+    system_prompt = build_system_prompt(customer_profile)
+    messages = [{"role": "system", "content": system_prompt}] + history[-6:]
     escalated = False
     reason = ""
 
@@ -137,11 +165,26 @@ def execute_turn(customer_id: str, history: list) -> tuple:
                 if fn == "search_products":
                     result = search_products(args.get("query", ""))
                 elif fn == "add_to_cart":
-                    result = add_product_to_cart(customer_id, args.get("product_id"), args.get("quantity", 1))
+                    result = add_product_to_cart(
+                        customer_id=telegram_id, 
+                        product_id=args.get("product_id"), 
+                        quantity=args.get("quantity", 1),
+                        customer_phone=customer_profile.get("phone", "")
+                    )
                 elif fn == "view_cart":
-                    result = view_customer_cart(customer_id)
+                    result = view_customer_cart(telegram_id, customer_profile.get("phone", ""))
                 elif fn == "clear_cart":
-                    result = clear_customer_cart(customer_id)
+                    result = clear_customer_cart(telegram_id)
+                elif fn == "save_customer_details":
+                    result = link_customer_identity(
+                        telegram_id=telegram_id,
+                        name=args.get("name"),
+                        phone=args.get("phone"),
+                        email=args.get("email"),
+                        city=args.get("city")
+                    )
+                    # Update active profile in place
+                    customer_profile.update(result)
                 elif fn == "track_order_live":
                     result = track_order_live(args.get("order_id", 0))
                 elif fn == "get_categories":
