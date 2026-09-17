@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Malltiple AI - Agent Command Center</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen p-6">
+    <div class="max-w-6xl mx-auto">
+        <header class="flex justify-between items-center pb-6 border-b border-slate-700 mb-8">
+            <div>
+                <h1 class="text-2xl font-bold text-amber-400">🛍️ Malltiple AI Command Center</h1>
+                <p class="text-sm text-slate-400">Human Agents, CSAT Ratings & Shopping Operations</p>
+            </div>
+            <div class="flex items-center gap-3">
+                <a href="/docs" target="_blank" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs font-semibold rounded-lg border border-slate-600 text-slate-300">Swagger API Docs</a>
+                <a href="/dashboard" class="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold text-sm rounded-lg transition">Refresh</a>
+            </div>
+        </header>
+
+        <!-- KPI Metric Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+                <span class="text-slate-400 text-xs font-semibold uppercase">Active Human Agents</span>
+                <p class="text-3xl font-extrabold mt-2 text-emerald-400">{{ metrics.total_agents }}</p>
+            </div>
+            <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+                <span class="text-slate-400 text-xs font-semibold uppercase">Tickets Resolved</span>
+                <p class="text-3xl font-extrabold mt-2 text-blue-400">{{ metrics.total_resolved }}</p>
+            </div>
+            <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+                <span class="text-slate-400 text-xs font-semibold uppercase">Average CSAT Rating</span>
+                <p class="text-3xl font-extrabold mt-2 text-amber-400">⭐ {{ metrics.avg_csat }} / 5.0</p>
+            </div>
+        </div>
+
+        <!-- Add Agent Form -->
+        <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 mb-8">
+            <h2 class="text-base font-semibold mb-4 text-slate-200">➕ Register Human Support Staff</h2>
+            <form method="POST" action="/dashboard/add-agent" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <input type="text" name="name" placeholder="Staff Name (e.g. Sarah J.)" required class="bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:border-amber-400">
+                <input type="text" name="telegram_id" placeholder="Telegram ID (e.g. 987654321)" required class="bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:border-amber-400">
+                <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold px-4 py-2 rounded-lg text-sm transition">Add Agent</button>
+            </form>
+        </div>
+
+        <!-- Agent Analytics Table -->
+        <div class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
+            <div class="p-4 border-b border-slate-700">
+                <h2 class="text-base font-semibold text-slate-200">📊 Support Agent Handling Times & Ratings</h2>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-sm text-slate-300">
+                    <thead class="bg-slate-900/60 text-slate-400 uppercase text-xs">
+                        <tr>
+                            <th class="p-4">Staff Member</th>
+                            <th class="p-4">Telegram ID</th>
+                            <th class="p-4">Tickets Resolved</th>
+                            <th class="p-4">Avg Handling Time</th>
+                            <th class="p-4">Satisfaction Score</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-700">
+                        {% for a in metrics.agents %}
+                        <tr class="hover:bg-slate-700/40">
+                            <td class="p-4 font-semibold text-white">{{ a.name }}</td>
+                            <td class="p-4 font-mono text-slate-400">{{ a.id }}</td>
+                            <td class="p-4">{{ a.resolved }}</td>
+                            <td class="p-4">{{ a.avg_time }}</td>
+                            <td class="p-4 text-amber-400">{{ a.rating_str }}</td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="5" class="p-6 text-center text-slate-500">No human agents registered yet. Use the form above to add your team.</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
