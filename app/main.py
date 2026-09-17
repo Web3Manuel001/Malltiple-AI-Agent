@@ -1,5 +1,6 @@
 import os
 import io
+from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
 
@@ -19,10 +20,16 @@ from app.services.brain import execute_turn
 from app.services.supervisor import audit_human_agent_message
 from app.services.voice import transcribe_audio_bytes, text_to_speech_bytes
 
+# Initialize Database tables
 Base.metadata.create_all(bind=engine)
-templates = Jinja2Templates(directory="app/templates")
+
+# Use absolute path to templates directory so Render never loses it
+BASE_DIR = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
 USER_SESSIONS = {}
 
+# --- TELEGRAM BOT LOGIC ---
 tg_app = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).build()
 
 async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -49,7 +56,14 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session["assigned_to"] = {"id": sender_id, "name": agent_name}
     session["escalated"] = True
 
-    ticket = TicketSession(customer_id=str(target_id), customer_name=session.get("name", "Customer"), assigned_agent_id=sender_id, assigned_agent_name=agent_name, status="claimed", claimed_at=datetime.utcnow())
+    ticket = TicketSession(
+        customer_id=str(target_id), 
+        customer_name=session.get("name", "Customer"), 
+        assigned_agent_id=sender_id, 
+        assigned_agent_name=agent_name, 
+        status="claimed", 
+        claimed_at=datetime.utcnow()
+    )
     db.add(ticket)
     db.commit()
 
@@ -220,6 +234,7 @@ async def customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Voice error: {e}")
 
+# --- FASTAPI APP LIFECYCLE ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tg_app.add_handler(CommandHandler("claim", claim_cmd))
@@ -240,16 +255,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Malltiple AI Agent Engine", lifespan=lifespan)
 
-@app.get("/", include_in_schema=False)
-def root_redirect():
-    return RedirectResponse(url="/dashboard")
-
 @app.get("/health")
-def health_check():
+def health():
     return {"status": "healthy"}
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def get_dashboard(request: Request, db: Session = Depends(get_db)):
+def render_dashboard(request: Request, db: Session):
     agents_raw = db.query(Agent).filter(Agent.is_active == True).all()
     total_agents = len(agents_raw)
     total_resolved = sum(a.tickets_resolved for a in agents_raw)
@@ -286,7 +296,15 @@ def get_dashboard(request: Request, db: Session = Depends(get_db)):
         "avg_csat": avg_csat,
         "agents": agents_data
     }
-    return templates.TemplateResponse("dashboard.html", {"request": request, "metrics": metrics})
+    return templates.TemplateResponse(request=request, name="dashboard.html", context={"metrics": metrics})
+
+@app.get("/", response_class=HTMLResponse)
+def root(request: Request, db: Session = Depends(get_db)):
+    return render_dashboard(request, db)
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def get_dashboard(request: Request, db: Session = Depends(get_db)):
+    return render_dashboard(request, db)
 
 @app.post("/dashboard/add-agent")
 def add_agent_route(name: str = Form(...), telegram_id: str = Form(...), db: Session = Depends(get_db)):
