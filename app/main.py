@@ -5,6 +5,7 @@ from app.core.config import settings
 from app.core.database import engine, Base
 from app.api.dashboard import router as dashboard_router
 from app.api.webhooks_telegram import router as telegram_router, tg_app
+from app.api.webhooks_whatsapp import router as whatsapp_router
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -36,5 +37,6 @@ def health_check():
     return {"status": "healthy", "service": "Malltiple Modular Engine"}
 
 # Mount Domain Routers
-app.include_router(dashboard_router)
-app.include_router(telegram_router)
+app.include_router(dashboard_router) #Dashboard router is included for handling dashboard-related endpoints
+app.include_router(telegram_router) #Telegram router is included for handling Telegram webhooks and interactions
+app.include_router(whatsapp_router) #Whatsapp router is included for handling WhatsApp webhooks and interactions

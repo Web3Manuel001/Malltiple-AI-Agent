@@ -14,6 +14,9 @@ class Settings:
     YARNGPT_API_KEY: str = os.getenv("YARNGPT_API_KEY", "")
     YARNGPT_VOICE: str = os.getenv("YARNGPT_VOICE", "Idera")
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./malltiple.db")
+    WHATSAPP_ACCESS_TOKEN: str = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+    WHATSAPP_PHONE_NUMBER_ID: str = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+    WHATSAPP_VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "malltiple_secure_verify_2026")
 
     # Render automatically sets RENDER_EXTERNAL_URL (e.g. https://malltiple-ai-agent.onrender.com)
     BASE_URL: str = os.getenv("RENDER_EXTERNAL_URL", "https://malltiple-ai-agent.onrender.com")
