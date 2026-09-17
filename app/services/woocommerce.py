@@ -1,10 +1,10 @@
 import html
 import requests
-from app.config import settings
+from app.core.config import settings
 
 HEADERS = {"User-Agent": "MalltipleAgent/1.0", "Content-Type": "application/json"}
 
-def _get_auth():
+def get_auth_params():
     return {
         "consumer_key": settings.CONSUMER_KEY,
         "consumer_secret": settings.CONSUMER_SECRET
@@ -13,7 +13,7 @@ def _get_auth():
 def search_products(query: str, per_page: int = 4) -> dict:
     clean_query = query.strip()
     endpoint = f"{settings.STORE_URL}/wp-json/wc/v3/products"
-    params = {**_get_auth(), "search": clean_query, "per_page": per_page}
+    params = {**get_auth_params(), "search": clean_query, "per_page": per_page}
 
     try:
         res = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
@@ -22,7 +22,7 @@ def search_products(query: str, per_page: int = 4) -> dict:
         if not products and len(clean_query.split()) > 1:
             words = [w for w in clean_query.split() if len(w) > 2]
             if words:
-                fallback = requests.get(endpoint, params={**_get_auth(), "search": words[0], "per_page": per_page}, headers=HEADERS, timeout=8)
+                fallback = requests.get(endpoint, params={**get_auth_params(), "search": words[0], "per_page": per_page}, headers=HEADERS, timeout=8)
                 if fallback.status_code == 200:
                     products = fallback.json()
 
@@ -44,7 +44,7 @@ def search_products(query: str, per_page: int = 4) -> dict:
 
 def get_categories() -> dict:
     endpoint = f"{settings.STORE_URL}/wp-json/wc/v3/products/categories"
-    params = {**_get_auth(), "per_page": 50, "hide_empty": True}
+    params = {**get_auth_params(), "per_page": 50, "hide_empty": True}
     try:
         res = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
         if res.status_code == 200:
@@ -53,50 +53,30 @@ def get_categories() -> dict:
     except Exception as e:
         return {"error": str(e)}
 
-def build_customer_cart(items: list) -> dict:
-    """
-    Safely calculates total price and provides direct link 
-    for customer to review cart and pay securely on Malltiple.
-    """
-    if not items:
-        return {"success": False, "error": "Cart is empty."}
-
-    total_price = 0.0
-    item_summaries = []
-    primary_id = items[0]["product_id"]
-    primary_qty = items[0].get("quantity", 1)
-
-    for item in items:
-        pid = item.get("product_id")
-        qty = item.get("quantity", 1)
-
-        res = requests.get(f"{settings.STORE_URL}/wp-json/wc/v3/products/{pid}", params=_get_auth(), headers=HEADERS, timeout=8)
+def get_product_by_id(product_id: int) -> dict:
+    endpoint = f"{settings.STORE_URL}/wp-json/wc/v3/products/{product_id}"
+    try:
+        res = requests.get(endpoint, params=get_auth_params(), headers=HEADERS, timeout=8)
         if res.status_code == 200:
-            pdata = res.json()
-            p_price = float(pdata.get("price") or 0.0)
-            p_name = pdata.get("name")
-            subtotal = p_price * qty
-            total_price += subtotal
-            item_summaries.append(f"{p_name} (x{qty}) - {subtotal:,.2f} Naira")
-
-    # Native, 100% fail-safe direct Add-to-Cart URL
-    cart_url = f"{settings.STORE_URL}/cart/?add-to-cart={primary_id}&quantity={primary_qty}"
-
-    return {
-        "success": True,
-        "items": item_summaries,
-        "total_naira": f"{total_price:,.2f}",
-        "cart_url": cart_url,
-        "message": f"Cart total is {total_price:,.2f} Naira. Click the link to review and pay securely on Malltiple."
-    }
+            p = res.json()
+            return {
+                "found": True,
+                "id": p.get("id"),
+                "name": p.get("name"),
+                "price": float(p.get("price") or 0.0),
+                "in_stock": p.get("stock_status") == "instock"
+            }
+        return {"found": False}
+    except Exception:
+        return {"found": False}
 
 def track_order_live(order_id: int) -> dict:
     endpoint = f"{settings.STORE_URL}/wp-json/wc/v3/orders/{order_id}"
     try:
-        res = requests.get(endpoint, params=_get_auth(), headers=HEADERS, timeout=8)
+        res = requests.get(endpoint, params=get_auth_params(), headers=HEADERS, timeout=8)
         if res.status_code == 200:
             order = res.json()
-            notes_res = requests.get(f"{endpoint}/notes", params=_get_auth(), headers=HEADERS, timeout=8)
+            notes_res = requests.get(f"{endpoint}/notes", params=get_auth_params(), headers=HEADERS, timeout=8)
             dispatch = [n.get("note") for n in notes_res.json() if n.get("customer_note")] if notes_res.status_code == 200 else []
             return {
                 "found": True,

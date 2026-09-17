@@ -1,7 +1,8 @@
 import json
 from groq import Groq
-from app.config import settings
-from app.services.woocommerce import search_products, get_categories, track_order_live, build_customer_cart
+from app.core.config import settings
+from app.services.woocommerce import search_products, get_categories, track_order_live
+from app.services.cart_service import add_product_to_cart, view_customer_cart, clear_customer_cart
 
 client = Groq(api_key=settings.GROQ_API_KEY)
 
@@ -21,32 +22,39 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "build_customer_cart",
-            "description": "Calculate total prices and generate the official Malltiple cart link for customer to pay on the website.",
+            "name": "add_to_cart",
+            "description": "Add a product to the customer's personal shopping cart.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "items": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "product_id": {"type": "integer"},
-                                "quantity": {"type": "integer"}
-                            },
-                            "required": ["product_id", "quantity"]
-                        }
-                    }
+                    "product_id": {"type": "integer", "description": "Numeric product ID"},
+                    "quantity": {"type": "integer", "description": "Quantity to add", "default": 1}
                 },
-                "required": ["items"]
+                "required": ["product_id"]
             }
         }
     },
     {
         "type": "function",
         "function": {
+            "name": "view_cart",
+            "description": "View the customer's current shopping cart items, total in Naira, and checkout link.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_cart",
+            "description": "Clear all items from the customer's shopping cart.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "track_order_live",
-            "description": "Track order status and dispatch updates using Order ID.",
+            "description": "Track order fulfillment status and dispatch updates using Order ID.",
             "parameters": {
                 "type": "object",
                 "properties": {"order_id": {"type": "integer"}},
@@ -78,20 +86,21 @@ TOOLS = [
 
 SYSTEM_PROMPT = """
 You are the official customer assistant for Malltiple (malltiple.com.ng), a Nigerian online marketplace.
-Help customers search products, prepare carts, check prices in Naira, and track live orders.
+Help customers search products, manage their personal cart, and track orders.
 
-SHOPPING & CART POLICY:
-- Help customers find items using `search_products`.
-- When they want to purchase, call `build_customer_cart` with product IDs and quantities.
-- Give them the itemized total in Naira and the direct link to review their cart and pay securely on the website.
+CART & SHOPPING WORKFLOW:
+- When customers search for items, use `search_products`.
+- When they want to add an item to their cart, call `add_to_cart` with the product_id and quantity.
+- When they ask "what is in my cart?" or "how much is my total?", call `view_cart`.
+- Provide the checkout link so they can complete payment securely on the Malltiple website.
 
 RULES:
 - Never write 'N' or '₦' before numbers. Always write '11,500 Naira'.
-- If customer demands a human or reports a dispute, call `escalate_to_human`.
-- Keep answers concise and helpful.
+- If customer demands a human or reports a double debit/dispute, call `escalate_to_human`.
+- Keep answers short, friendly, and helpful.
 """
 
-def execute_turn(history: list) -> tuple:
+def execute_turn(customer_id: str, history: list) -> tuple:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-6:]
     escalated = False
     reason = ""
@@ -127,8 +136,12 @@ def execute_turn(history: list) -> tuple:
 
                 if fn == "search_products":
                     result = search_products(args.get("query", ""))
-                elif fn == "build_customer_cart":
-                    result = build_customer_cart(args.get("items", []))
+                elif fn == "add_to_cart":
+                    result = add_product_to_cart(customer_id, args.get("product_id"), args.get("quantity", 1))
+                elif fn == "view_cart":
+                    result = view_customer_cart(customer_id)
+                elif fn == "clear_cart":
+                    result = clear_customer_cart(customer_id)
                 elif fn == "track_order_live":
                     result = track_order_live(args.get("order_id", 0))
                 elif fn == "get_categories":
