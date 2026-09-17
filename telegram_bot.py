@@ -1,20 +1,31 @@
 import os
+import io
 import json
 import logging
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import asyncio
+from datetime import datetime
 from aiohttp import web
+from dotenv import load_dotenv
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, 
+    CallbackQueryHandler, filters, ContextTypes
+)
+
 from groq import Groq
-import io
-from voice_engine import transcribe_audio_bytes, text_to_speech_bytes
-from woo_tools import search_products, get_order_status, get_categories
+from woo_tools import (
+    search_products, get_categories, track_order_live, 
+    create_order_and_payment_link
+)
 from memory import (
-    get_customer, save_or_update_customer, log_message, 
-    add_agent, is_authorized_agent, get_all_active_agents
+    get_customer, save_or_update_customer, log_message,
+    add_agent, is_authorized_agent, get_all_active_agents,
+    record_ticket_claim, record_ticket_resolution, record_csat_rating,
+    get_agent_dashboard_metrics
 )
 from supervisor import audit_human_agent_message
+from voice_engine import transcribe_audio_bytes, text_to_speech_bytes
 
 load_dotenv()
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -24,19 +35,18 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 client = Groq(api_key=GROQ_API_KEY)
-
-# Track sessions: {user_id: {"history": [...], "escalated": False, "assigned_to": None}}
 USER_SESSIONS = {}
 
+# --- TOOLS DEFINITION ---
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "search_products",
-            "description": "Search products in Malltiple catalog by name or keyword.",
+            "description": "Search products in the catalog by 1-2 core keywords.",
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string", "description": "Search term"}},
+                "properties": {"query": {"type": "string", "description": "Search keyword (e.g. 'oats', 'soya')"}},
                 "required": ["query"]
             }
         }
@@ -44,12 +54,41 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_order_status",
-            "description": "Look up fulfillment status and items using numeric Order ID.",
+            "name": "track_order_live",
+            "description": "Track order fulfillment status, items, and courier/dispatch notes using numeric Order ID.",
             "parameters": {
                 "type": "object",
-                "properties": {"order_id": {"type": "integer", "description": "Order ID"}},
+                "properties": {"order_id": {"type": "integer", "description": "WooCommerce numeric order ID"}},
                 "required": ["order_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_order_and_payment_link",
+            "description": "Place an order for a customer and generate a secure Paystack payment link.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_name": {"type": "string", "description": "Customer full name"},
+                    "phone": {"type": "string", "description": "Phone number"},
+                    "delivery_address": {"type": "string", "description": "Street address"},
+                    "city": {"type": "string", "description": "City/State (e.g. 'Lagos')"},
+                    "line_items": {
+                        "type": "array",
+                        "description": "List of items with product_id and quantity",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "product_id": {"type": "integer"},
+                                "quantity": {"type": "integer"}
+                            },
+                            "required": ["product_id", "quantity"]
+                        }
+                    }
+                },
+                "required": ["customer_name", "phone", "delivery_address", "city", "line_items"]
             }
         }
     },
@@ -65,7 +104,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "lookup_customer",
-            "description": "Look up customer by phone number or email address.",
+            "description": "Look up customer profile by phone or email.",
             "parameters": {
                 "type": "object",
                 "properties": {"identifier": {"type": "string", "description": "Phone or Email"}},
@@ -77,7 +116,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "escalate_to_human",
-            "description": "Hand over the chat to a human agent for complex disputes or customer demand.",
+            "description": "Escalate conversation to a human support agent.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -91,32 +130,20 @@ TOOLS = [
 ]
 
 SYSTEM_PROMPT = """
-You are the official customer assistant for Malltiple (malltiple.com.ng), a Nigerian multi-department online marketplace.
+You are the official customer assistant for Malltiple (malltiple.com.ng), a Nigerian online marketplace.
+Help customers search products, place orders, check prices (in Naira), and track live delivery.
 
-STORE SCOPE:
-Malltiple offers Electronics, Bags & Fashion, Car Accessories, Groceries, Healthcare, Baby & Pregnancy, Household Needs, and more.
+ORDERING & PAYMENTS:
+- When a customer wants to buy, gather their Name, Phone, Delivery Address, City, and Items.
+- Call `create_order_and_payment_link` to create the order and give them the payment URL.
 
-PHONETIC ERROR CORRECTION (CRITICAL FOR VOICE):
-- Customers speak with various Nigerian accents and mobile background noise.
-- If a voice transcript contains phonetic slips or misheard words (e.g., 'Quaker olds' instead of 'Quaker oats', 'Sawyer oil' instead of 'Soya oil', 'Mall multiple' instead of 'Malltiple'), intelligently interpret the real product they meant and search for that.
+TRACKING:
+- When a customer asks about order status or location, call `track_order_live`.
 
-CRITICAL SPEECH & CURRENCY RULE:
-- NEVER write 'N' or '₦' before numbers (NEVER write 'N3,500' or '₦3,500').
-- ALWAYS write the number followed by the word 'Naira' (e.g. '3,500 Naira', '68,000 Naira') so it sounds natural when spoken aloud.
-- Keep answers concise and conversational.
-
-STORE BOUNDARIES:
-- NEVER guess or invent product prices, stock status, or inventory. You MUST call `search_products` for every product inquiry.
-- Call `get_order_status` for order tracking inquiries.
-- Call `get_categories` when asked what categories or departments exist.
-- If an item is not found, state clearly that it is not currently listed. Never guess alternatives.
-
-SEARCH QUERY PARSING RULE:
-- When calling `search_products`, pass ONLY the 1 or 2 essential product keywords (e.g. if the customer says "Can you please check the price of Quaker Oats 1.8kg pouch", search ONLY for "Quaker Oats"). 
-- Never include conversational filler words like "please", "price of", or "do you have" in the tool arguments.
-
-HUMAN ESCALATION:
-- If a customer demands a human, expresses deep frustration, or reports a double debit/payment dispute, call `escalate_to_human` immediately.
+CRITICAL RULES:
+- Never write 'N' or '₦' before numbers. Always write the number followed by the word 'Naira' (e.g. '11,500 Naira').
+- If customer demands a human or reports a dispute, call `escalate_to_human`.
+- Keep answers concise and helpful.
 """
 
 def run_agent_turn(user_id: int, user_text: str, user_name: str):
@@ -127,16 +154,13 @@ def run_agent_turn(user_id: int, user_text: str, user_name: str):
     if session["escalated"]:
         return None, False, ""
 
-    # Keep only the last 6 messages to stay well within token limits
     if len(session["history"]) > 6:
         session["history"] = session["history"][-6:]
 
     session["history"].append({"role": "user", "content": user_text})
+    messages_for_api = [{"role": "system", "content": SYSTEM_PROMPT}] + list(session["history"])
     escalated_flag = False
     escalation_reason = ""
-
-    # Working copy of messages for this specific turn
-    messages_for_api = [{"role": "system", "content": SYSTEM_PROMPT}] + list(session["history"])
 
     while True:
         try:
@@ -146,24 +170,18 @@ def run_agent_turn(user_id: int, user_text: str, user_name: str):
                 tools=TOOLS,
                 tool_choice="auto",
                 temperature=0.2,
-                max_tokens=300
+                max_tokens=400
             )
-        except Exception as api_err:
-            print(f"❌ Groq API Error: {api_err}")
-            return "Sorry, I had a temporary glitch checking the store. Could you repeat that?", False, ""
+        except Exception as e:
+            return "Sorry, I had a brief issue. Could you repeat that?", False, ""
 
         resp_msg = response.choices[0].message
         if resp_msg.tool_calls:
-            # Append assistant message with tool calls
             messages_for_api.append({
                 "role": "assistant",
                 "content": resp_msg.content or "",
                 "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments}
-                    }
+                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                     for tc in resp_msg.tool_calls
                 ]
             })
@@ -175,8 +193,16 @@ def run_agent_turn(user_id: int, user_text: str, user_name: str):
 
                 if fn_name == "search_products":
                     result = search_products(args.get("query", ""))
-                elif fn_name == "get_order_status":
-                    result = get_order_status(args.get("order_id", 0))
+                elif fn_name == "track_order_live":
+                    result = track_order_live(args.get("order_id", 0))
+                elif fn_name == "create_order_and_payment_link":
+                    result = create_order_and_payment_link(
+                        customer_name=args.get("customer_name"),
+                        phone=args.get("phone"),
+                        delivery_address=args.get("delivery_address"),
+                        city=args.get("city"),
+                        line_items=args.get("line_items", [])
+                    )
                 elif fn_name == "get_categories":
                     result = get_categories()
                 elif fn_name == "lookup_customer":
@@ -189,79 +215,16 @@ def run_agent_turn(user_id: int, user_text: str, user_name: str):
                 else:
                     result = {"error": "Unknown tool"}
 
-                messages_for_api.append({
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "name": fn_name,
-                    "content": json.dumps(result)
-                })
+                messages_for_api.append({"role": "tool", "tool_call_id": tool_id, "name": fn_name, "content": json.dumps(result)})
             continue
         else:
             bot_text = resp_msg.content or ""
-            # Save clean final assistant text into persistent session history
             session["history"].append({"role": "assistant", "content": bot_text})
             return bot_text, escalated_flag, escalation_reason
-# --- COMMAND HANDLERS ---
 
-async def add_agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: /addagent <telegram_id> <name>"""
-    sender_id = str(update.effective_user.id)
-    if sender_id != str(ADMIN_CHAT_ID):
-        await update.message.reply_text("⛔ Only the Master Admin can register agents.")
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: `/addagent <telegram_id> <agent_name>`", parse_mode="Markdown")
-        return
-
-    agent_id = args[0]
-    agent_name = " ".join(args[1:])
-    msg = add_agent(agent_id, agent_name)
-    await update.message.reply_text(f"✅ {msg}")
+# --- TELEGRAM BOT COMMANDS ---
 
 async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Agent command: /claim <user_id>"""
-    sender_id = str(update.effective_user.id)
-    agent_check = is_authorized_agent(sender_id)
-    is_admin = sender_id == str(ADMIN_CHAT_ID)
-
-    if not agent_check["authorized"] and not is_admin:
-        await update.message.reply_text("⛔ You are not an authorized agent.")
-        return
-
-    agent_name = agent_check["name"] if agent_check["authorized"] else "Master Admin"
-
-    if not context.args:
-        await update.message.reply_text("Usage: `/claim <user_id>`", parse_mode="Markdown")
-        return
-
-    target_user_id = int(context.args[0])
-    session = USER_SESSIONS.get(target_user_id)
-
-    if not session:
-        await update.message.reply_text("❌ No active session found for that user.")
-        return
-
-    session["assigned_to"] = {"id": sender_id, "name": agent_name}
-    session["escalated"] = True
-
-    # Inform the agent
-    await update.message.reply_text(
-        f"🎯 You have claimed customer `{target_user_id}`.\nUse `/reply {target_user_id} <message>` to chat.",
-        parse_mode="Markdown"
-    )
-
-    # Inform Master Admin
-    if sender_id != str(ADMIN_CHAT_ID) and ADMIN_CHAT_ID:
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=f"📌 Agent *{agent_name}* claimed customer `{target_user_id}`.",
-            parse_mode="Markdown"
-        )
-
-async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Agent command: /reply <user_id> <message>"""
     sender_id = str(update.effective_user.id)
     agent_check = is_authorized_agent(sender_id)
     is_admin = sender_id == str(ADMIN_CHAT_ID)
@@ -270,9 +233,36 @@ async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Unauthorized.")
         return
 
-    agent_name = agent_check["name"] if agent_check["authorized"] else "Master Admin"
-    args = context.args
+    agent_name = agent_check["name"] if agent_check["authorized"] else "Admin"
+    if not context.args:
+        await update.message.reply_text("Usage: `/claim <user_id>`", parse_mode="Markdown")
+        return
 
+    target_user_id = int(context.args[0])
+    session = USER_SESSIONS.get(target_user_id)
+    if not session:
+        await update.message.reply_text("❌ No active session found.")
+        return
+
+    session["assigned_to"] = {"id": sender_id, "name": agent_name}
+    session["escalated"] = True
+
+    # Record Claim in DB to start duration timer
+    record_ticket_claim(target_user_id, session.get("name", "Customer"), sender_id, agent_name)
+
+    await update.message.reply_text(f"🎯 Claimed customer `{target_user_id}`. Use `/reply {target_user_id} <msg>`.", parse_mode="Markdown")
+
+async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sender_id = str(update.effective_user.id)
+    agent_check = is_authorized_agent(sender_id)
+    is_admin = sender_id == str(ADMIN_CHAT_ID)
+
+    if not agent_check["authorized"] and not is_admin:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+
+    agent_name = agent_check["name"] if agent_check["authorized"] else "Admin"
+    args = context.args
     if len(args) < 2:
         await update.message.reply_text("Usage: `/reply <user_id> <message>`", parse_mode="Markdown")
         return
@@ -280,42 +270,22 @@ async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user_id = int(args[0])
     reply_text = " ".join(args[1:])
 
-    # 1. RUN SUPERVISOR FRAUD AUDIT ON HUMAN AGENT
+    # AI Supervisor Audit
     audit = audit_human_agent_message(agent_name, reply_text)
     if audit.get("violation_detected"):
-        warning = (
-            f"🚨 *SUPERVISOR BLOCKED MESSAGE!* (Agent: {agent_name})\n"
-            f"• Risk: {audit.get('risk_level')}\n"
-            f"• Reason: {audit.get('reason')}\n"
-            f"Message was NOT sent to the customer."
-        )
+        warning = f"🚨 *SUPERVISOR BLOCKED MESSAGE!*\n• Reason: {audit.get('reason')}\nMessage not delivered."
         await update.message.reply_text(warning, parse_mode="Markdown")
-        if ADMIN_CHAT_ID and sender_id != str(ADMIN_CHAT_ID):
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ *AGENT COMPLIANCE ALERT:*\n{warning}", parse_mode="Markdown")
         return
 
-    # 2. Deliver message to Customer
     try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=f"👨‍💼 *Malltiple Support ({agent_name}):*\n{reply_text}",
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=target_user_id, text=f"👨‍💼 *Malltiple Support ({agent_name}):*\n{reply_text}", parse_mode="Markdown")
         log_message(user_id=str(target_user_id), sender=f"Agent: {agent_name}", text=reply_text)
         await update.message.reply_text(f"✅ Delivered to `{target_user_id}`.", parse_mode="Markdown")
-
-        # 3. Mirror to Master Admin so Admin always sees everything
-        if ADMIN_CHAT_ID and sender_id != str(ADMIN_CHAT_ID):
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=f"👁️ *[MIRROR]* Agent *{agent_name}* ➔ Cust `{target_user_id}`:\n\"{reply_text}\"",
-                parse_mode="Markdown"
-            )
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to deliver: {e}")
+        await update.message.reply_text(f"❌ Failed: {e}")
 
 async def resolve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return customer conversation back to AI: /resolve <user_id>"""
+    """Marks ticket resolved, records handling duration, and sends CSAT rating to customer."""
     sender_id = str(update.effective_user.id)
     if not is_authorized_agent(sender_id)["authorized"] and sender_id != str(ADMIN_CHAT_ID):
         await update.message.reply_text("⛔ Unauthorized.")
@@ -329,145 +299,74 @@ async def resolve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = USER_SESSIONS.get(target_user_id)
     if session:
         session["escalated"] = False
+        assigned_id = session.get("assigned_to", {}).get("id", sender_id)
         session["assigned_to"] = None
-        await update.message.reply_text(f"✅ Ticket for `{target_user_id}` marked resolved. AI is active again.", parse_mode="Markdown")
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text="🤝 Your inquiry has been marked as resolved by our team. Our AI assistant is here if you need anything else!"
+
+        # 1. Record resolution and calculate duration
+        res = record_ticket_resolution(str(target_user_id), assigned_id)
+        duration_mins = res["duration_seconds"] // 60
+        duration_secs = res["duration_seconds"] % 60
+        agent_name = res["agent_name"]
+
+        await update.message.reply_text(
+            f"✅ Ticket resolved!\n⏱️ Duration: {duration_mins}m {duration_secs}s.\nCustomer rating prompt sent.",
+            parse_mode="Markdown"
         )
 
-async def handle_customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles incoming audio voice notes from customers."""
-    user = update.effective_user
-    user_id = user.id
-    user_name = user.full_name or user.username or "Customer"
+        # 2. Send CSAT Rating prompt to customer
+        ticket_id = res["ticket_id"] or 0
+        keyboard = [
+            [
+                InlineKeyboardButton("⭐ 1", callback_data=f"rate:{ticket_id}:{assigned_id}:{agent_name}:1"),
+                InlineKeyboardButton("⭐ 2", callback_data=f"rate:{ticket_id}:{assigned_id}:{agent_name}:2"),
+                InlineKeyboardButton("⭐ 3", callback_data=f"rate:{ticket_id}:{assigned_id}:{agent_name}:3"),
+                InlineKeyboardButton("⭐ 4", callback_data=f"rate:{ticket_id}:{assigned_id}:{agent_name}:4"),
+                InlineKeyboardButton("⭐ 5", callback_data=f"rate:{ticket_id}:{assigned_id}:{agent_name}:5"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Show 'recording voice' indicator on Telegram
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"🤝 Your issue has been resolved by *{agent_name}*.\n\nHow would you rate your support experience today?",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
 
-    try:
-        # 1. Download voice note bytes directly into memory
-        voice_file = await context.bot.get_file(update.message.voice.file_id)
-        audio_bytearray = await voice_file.download_as_bytearray()
-        audio_bytes = bytes(audio_bytearray)
+async def handle_rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processes customer CSAT rating button clicks."""
+    query = update.callback_query
+    await query.answer()
 
-        # 2. Transcribe with Deepgram Nova-2
-        stt_result = transcribe_audio_bytes(audio_bytes)
-        if not stt_result.get("success") or not stt_result.get("text"):
-            await update.message.reply_text("🎙️ I couldn't hear that clearly. Could you please speak closer to the mic or type it?")
-            return
+    data = query.data.split(":")
+    if data[0] == "rate":
+        ticket_id = int(data[1])
+        agent_id = data[2]
+        agent_name = data[3]
+        rating = int(data[4])
 
-        transcribed_text = stt_result["text"]
-        print(f"\n🎤 [Voice Transcribed] {user_name}: \"{transcribed_text}\"")
-
-        # 3. Mirror transcription to Admin
-        if ADMIN_CHAT_ID and str(user_id) != str(ADMIN_CHAT_ID):
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=f"🎙️ *[VOICE INCOMING]* From: {user_name} (`{user_id}`)\nTranscript: \"_{transcribed_text}_\"",
-                parse_mode="Markdown"
-            )
-
-        # 4. Log customer message
-        log_message(user_id=str(user_id), sender="Customer (Voice)", text=transcribed_text, user_name=user_name)
-
-        # 5. Check if session is assigned to an agent
-        session = USER_SESSIONS.get(user_id)
-        if session and session.get("escalated"):
-            assigned = session.get("assigned_to")
-            if assigned:
-                await context.bot.send_message(
-                    chat_id=assigned["id"],
-                    text=f"🎙️ *[VOICE UPDATE]* From customer {user_name} (`{user_id}`):\n\"{transcribed_text}\"",
-                    parse_mode="Markdown"
-                )
-            else:
-                await update.message.reply_text("⏳ A customer care agent has been notified and will reply shortly.")
-            return
-
-        # 6. Run AI Brain
-        bot_reply, was_escalated, reason = run_agent_turn(user_id, transcribed_text, user_name)
-
-        if bot_reply:
-            log_message(user_id=str(user_id), sender="Malltiple AI", text=bot_reply, user_name=user_name)
-
-            # 7. Convert AI reply to Voice with ElevenLabs
-            try:
-                tts_bytes = text_to_speech_bytes(bot_reply)
-                voice_io = io.BytesIO(tts_bytes)
-                voice_io.name = "reply.mp3"
-
-                # Reply with Voice Note AND text caption
-                await update.message.reply_voice(voice=voice_io, caption=bot_reply)
-            except Exception as tts_err:
-                print(f"TTS Fallback error: {tts_err}")
-                # If TTS fails or quota is low, fallback gracefully to text
-                await update.message.reply_text(bot_reply)
-
-            if ADMIN_CHAT_ID and str(user_id) != str(ADMIN_CHAT_ID):
-                await context.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text=f"🤖 *[AI VOICE REPLY]* To: {user_name} (`{user_id}`)\n{bot_reply}"
-                )
-
-        # Handle escalation if triggered by voice
-        if was_escalated:
-            alert = (
-                f"🚨 *URGENT ESCALATION VIA VOICE!*\n\n"
-                f"• Customer: {user_name} (`{user_id}`)\n"
-                f"• Reason: {reason}\n\n"
-                f"👉 Claim with: `/claim {user_id}`"
-            )
-            if ADMIN_CHAT_ID:
-                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=alert, parse_mode="Markdown")
-            for agent in get_all_active_agents():
-                if str(agent["id"]) != str(ADMIN_CHAT_ID):
-                    try:
-                        await context.bot.send_message(chat_id=agent["id"], text=alert, parse_mode="Markdown")
-                    except Exception:
-                        pass
-
-    except Exception as e:
-        print(f"Voice handling error: {e}")
-        await update.message.reply_text("⚠️ An error occurred processing your voice note. Please try again.")
-
-# --- CUSTOMER MESSAGE HANDLER ---
+        record_csat_rating(ticket_id, str(query.from_user.id), agent_id, agent_name, rating)
+        await query.edit_message_text(f"❤️ Thank you for rating *{agent_name}* {rating} out of 5 stars! We appreciate your feedback.", parse_mode="Markdown")
 
 async def handle_customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     user_name = user.full_name or user.username or "Customer"
     text = update.message.text
-
     if text.startswith("/"):
         return
 
     log_message(user_id=str(user_id), sender="Customer", text=text, user_name=user_name)
 
-    # Mirror customer message to Master Admin
-    if ADMIN_CHAT_ID and str(user_id) != str(ADMIN_CHAT_ID):
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=f"💬 *[INCOMING]* From: {user_name} (`{user_id}`)\nMessage: {text}",
-            parse_mode="Markdown"
-        )
-
-    # Check if session is assigned to an agent
     session = USER_SESSIONS.get(user_id)
     if session and session.get("escalated"):
         assigned = session.get("assigned_to")
         if assigned:
-            # Forward customer's new message directly to their assigned agent
-            await context.bot.send_message(
-                chat_id=assigned["id"],
-                text=f"💬 *[UPDATE]* From your customer {user_name} (`{user_id}`):\n\"{text}\"",
-                parse_mode="Markdown"
-            )
+            await context.bot.send_message(chat_id=assigned["id"], text=f"💬 *[Cust Update]* {user_name} (`{user_id}`):\n\"{text}\"", parse_mode="Markdown")
         else:
-            await update.message.reply_text("⏳ A customer care agent has been notified and will take over shortly.")
+            await update.message.reply_text("⏳ An agent will respond shortly.")
         return
 
-    # Process AI
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     bot_reply, was_escalated, reason = run_agent_turn(user_id, text, user_name)
 
@@ -475,74 +374,195 @@ async def handle_customer_message(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(bot_reply)
         log_message(user_id=str(user_id), sender="Malltiple AI", text=bot_reply, user_name=user_name)
 
-        if ADMIN_CHAT_ID and str(user_id) != str(ADMIN_CHAT_ID):
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=f"🤖 *[AI REPLY]* To: {user_name} (`{user_id}`)\n{bot_reply}"
-            )
-
-    # If Escalated, broadcast to all agents and Admin
     if was_escalated:
-        escalation_broadcast = (
-            f"🚨 *URGENT ESCALATION REQUIRED!*\n\n"
-            f"• Customer: {user_name} (`{user_id}`)\n"
-            f"• Reason: {reason}\n\n"
-            f"👉 *To claim this customer, type:*\n"
-            f"`/claim {user_id}`"
-        )
-        # 1. Alert Admin
+        alert = f"🚨 *ESCALATION:*\n• Cust: {user_name} (`{user_id}`)\n• Reason: {reason}\n👉 Claim: `/claim {user_id}`"
         if ADMIN_CHAT_ID:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=escalation_broadcast, parse_mode="Markdown")
-
-        # 2. Broadcast to all active team agents
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=alert, parse_mode="Markdown")
         for agent in get_all_active_agents():
             if str(agent["id"]) != str(ADMIN_CHAT_ID):
                 try:
-                    await context.bot.send_message(chat_id=agent["id"], text=escalation_broadcast, parse_mode="Markdown")
+                    await context.bot.send_message(chat_id=agent["id"], text=alert, parse_mode="Markdown")
                 except Exception:
                     pass
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to Malltiple Assistant! I can help you search products, check prices, and track orders. What are you looking for today?"
-    )
+async def handle_customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    user_name = user.full_name or "Customer"
 
-async def health_check(request):
-    return web.Response(text="Malltiple Bot is running healthy!")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
+    try:
+        voice_file = await context.bot.get_file(update.message.voice.file_id)
+        audio_bytes = bytes(await voice_file.download_as_bytearray())
 
-async def start_health_server():
+        stt_res = transcribe_audio_bytes(audio_bytes)
+        if not stt_res.get("success") or not stt_res.get("text"):
+            await update.message.reply_text("🎙️ I couldn't hear that clearly. Please try again.")
+            return
+
+        text = stt_res["text"]
+        bot_reply, was_escalated, reason = run_agent_turn(user_id, text, user_name)
+        if bot_reply:
+            try:
+                tts_bytes = text_to_speech_bytes(bot_reply)
+                v_io = io.BytesIO(tts_bytes)
+                v_io.name = "reply.mp3"
+                await update.message.reply_voice(voice=v_io, caption=bot_reply)
+            except Exception:
+                await update.message.reply_text(bot_reply)
+    except Exception as e:
+        print(f"Voice error: {e}")
+
+# --- WEB CONTROL DASHBOARD ---
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Malltiple AI - Agent Command Center</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen p-6">
+    <div class="max-w-6xl mx-auto">
+        <header class="flex justify-between items-center pb-6 border-b border-slate-700 mb-6">
+            <div>
+                <h1 class="text-2xl font-bold text-amber-400">🛍️ Malltiple AI Agent Control</h1>
+                <p class="text-sm text-slate-400">Human Support & Performance Analytics</p>
+            </div>
+            <a href="/dashboard" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-sm font-semibold rounded-lg border border-slate-600">Refresh Data</a>
+        </header>
+
+        <!-- Metric Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+                <span class="text-slate-400 text-sm">Active Human Agents</span>
+                <p class="text-3xl font-extrabold mt-1 text-emerald-400">{{TOTAL_AGENTS}}</p>
+            </div>
+            <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+                <span class="text-slate-400 text-sm">Tickets Resolved Today</span>
+                <p class="text-3xl font-extrabold mt-1 text-blue-400">{{TOTAL_RESOLVED}}</p>
+            </div>
+            <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+                <span class="text-slate-400 text-sm">Average CSAT Rating</span>
+                <p class="text-3xl font-extrabold mt-1 text-amber-400">⭐ {{AVG_CSAT}} / 5.0</p>
+            </div>
+        </div>
+
+        <!-- Add Agent Form -->
+        <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 mb-8">
+            <h2 class="text-lg font-semibold mb-4 text-slate-200">➕ Register New Human Support Agent</h2>
+            <form method="POST" action="/api/add-agent" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <input type="text" name="name" placeholder="Agent Full Name (e.g. Sarah J.)" required class="bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:border-amber-400">
+                <input type="text" name="telegram_id" placeholder="Telegram User ID (e.g. 987654321)" required class="bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:border-amber-400">
+                <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold px-4 py-2 rounded-lg text-sm transition">Add Agent</button>
+            </form>
+        </div>
+
+        <!-- Agent Performance Table -->
+        <div class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
+            <div class="p-4 border-b border-slate-700">
+                <h2 class="text-lg font-semibold text-slate-200">📊 Agent Performance & Handling Time</h2>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-sm text-slate-300">
+                    <thead class="bg-slate-900/50 text-slate-400 uppercase text-xs">
+                        <tr>
+                            <th class="p-4">Agent Name</th>
+                            <th class="p-4">Telegram ID</th>
+                            <th class="p-4">Tickets Resolved</th>
+                            <th class="p-4">Avg Handling Time</th>
+                            <th class="p-4">Customer Rating</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-700">
+                        {{AGENT_ROWS}}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+async def handle_dashboard(request):
+    data = get_agent_dashboard_metrics()
+    agents = data["agents"]
+
+    total_agents = len(agents)
+    total_resolved = sum(a["resolved"] for a in agents)
+    avg_csat = round(sum(a["avg_rating"] for a in agents) / total_agents, 1) if total_agents > 0 else 5.0
+
+    rows_html = ""
+    for a in agents:
+        mins = a["avg_time_seconds"] // 60
+        secs = a["avg_time_seconds"] % 60
+        time_str = f"{mins}m {secs}s" if a["resolved"] > 0 else "N/A"
+        rating_str = f"⭐ {a['avg_rating']} ({a['ratings_count']} ratings)" if a["ratings_count"] > 0 else "No ratings yet"
+
+        rows_html += f"""
+        <tr class="hover:bg-slate-700/40">
+            <td class="p-4 font-semibold text-white">{a['name']}</td>
+            <td class="p-4 font-mono text-slate-400">{a['id']}</td>
+            <td class="p-4">{a['resolved']}</td>
+            <td class="p-4">{time_str}</td>
+            <td class="p-4 text-amber-400">{rating_str}</td>
+        </tr>
+        """
+
+    if not rows_html:
+        rows_html = "<tr><td colspan='5' class='p-4 text-center text-slate-500'>No agents registered yet. Use the form above.</td></tr>"
+
+    html = DASHBOARD_HTML.replace("{{TOTAL_AGENTS}}", str(total_agents))
+    html = html.replace("{{TOTAL_RESOLVED}}", str(total_resolved))
+    html = html.replace("{{AVG_CSAT}}", str(avg_csat))
+    html = html.replace("{{AGENT_ROWS}}", rows_html)
+
+    return web.Response(text=html, content_type="text/html")
+
+async def handle_add_agent_form(request):
+    data = await request.post()
+    name = data.get("name")
+    tg_id = data.get("telegram_id")
+    if name and tg_id:
+        add_agent(tg_id, name)
+    raise web.HTTPFound("/dashboard")
+
+async def start_web_server():
     app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
+    app.router.add_get("/", lambda r: web.Response(text="Malltiple AI Service Healthy"))
+    app.router.add_get("/health", lambda r: web.Response(text="OK"))
+    app.router.add_get("/dashboard", handle_dashboard)
+    app.router.add_post("/api/add-agent", handle_add_agent_form)
+
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Health check web server running on port {port}")
+    print(f"🌐 Web Control Dashboard running at http://0.0.0.0:{port}/dashboard")
+
+# --- MAIN LOOP ---
 
 if __name__ == "__main__":
-    print("🚀 Malltiple Multi-Agent Support Desk is starting...")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    print("🚀 Malltiple Multi-Agent & Commerce Engine Starting...")
+    tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("addagent", add_agent_cmd))
-    app.add_handler(CommandHandler("claim", claim_cmd))
-    app.add_handler(CommandHandler("reply", reply_cmd))
-    app.add_handler(CommandHandler("resolve", resolve_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_customer_message))
-    app.add_handler(CommandHandler("resolve", resolve_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_customer_message))
-    app.add_handler(MessageHandler(filters.VOICE, handle_customer_voice))
+    tg_app.add_handler(CommandHandler("claim", claim_cmd))
+    tg_app.add_handler(CommandHandler("reply", reply_cmd))
+    tg_app.add_handler(CommandHandler("resolve", resolve_cmd))
+    tg_app.add_handler(CallbackQueryHandler(handle_rating_callback))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_customer_message))
+    tg_app.add_handler(MessageHandler(filters.VOICE, handle_customer_voice))
 
-    # Run both the web health server and the telegram polling
     async def main():
-        await start_health_server()
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        print("✅ System Online! Listening for messages...")
-        # Keep running forever
+        await start_web_server()
+        await tg_app.initialize()
+        await tg_app.start()
+        await tg_app.updater.start_polling()
+        print("✅ System Online! Both Bot and Dashboard are live.")
         while True:
             await asyncio.sleep(3600)
 

@@ -1,4 +1,5 @@
 import os
+import html
 import requests
 from dotenv import load_dotenv
 
@@ -7,8 +8,7 @@ load_dotenv()
 STORE_URL = os.getenv("WOO_STORE_URL")
 CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY")
 CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET")
-
-HEADERS = {"User-Agent": "MalltipleAgent/1.0"}
+HEADERS = {"User-Agent": "MalltipleAgent/1.0", "Content-Type": "application/json"}
 
 def _get_auth_params(extra_params=None):
     params = {
@@ -20,28 +20,19 @@ def _get_auth_params(extra_params=None):
     return params
 
 def search_products(query: str, per_page: int = 4) -> dict:
-    """
-    Smart product search with automatic keyword trimming and fuzzy fallback.
-    """
+    """Smart product search with fuzzy fallback."""
     clean_query = query.strip()
     endpoint = f"{STORE_URL}/wp-json/wc/v3/products"
-
-    # Attempt 1: Direct Search
     params = _get_auth_params({"search": clean_query, "per_page": per_page})
 
     try:
         response = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
         products = response.json() if response.status_code == 200 else []
 
-        # Attempt 2 (Fuzzy Fallback): If 0 results and query has multiple words,
-        # try searching with the primary keyword (first word or longest word)
         if not products and len(clean_query.split()) > 1:
             words = [w for w in clean_query.split() if len(w) > 2]
             if words:
-                fallback_keyword = words[0]  # E.g. from "Quaker Olds" -> try "Quaker"
-                print(f"🔄 [Fuzzy Fallback] Retrying search with root keyword: '{fallback_keyword}'...")
-                params = _get_auth_params({"search": fallback_keyword, "per_page": per_page})
-                fallback_res = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
+                fallback_res = requests.get(endpoint, params=_get_auth_params({"search": words[0], "per_page": per_page}), headers=HEADERS, timeout=8)
                 if fallback_res.status_code == 200:
                     products = fallback_res.json()
 
@@ -58,12 +49,81 @@ def search_products(query: str, per_page: int = 4) -> dict:
                 "permalink": item.get("permalink")
             })
         return {"found": True, "count": len(clean_results), "products": clean_results}
-
     except Exception as e:
         return {"error": f"Product search error: {str(e)}"}
-def get_order_status(order_id: int) -> dict:
+
+def get_categories() -> dict:
+    """Fetch all active categories."""
+    endpoint = f"{STORE_URL}/wp-json/wc/v3/products/categories"
+    params = _get_auth_params({"per_page": 50, "hide_empty": True})
+    try:
+        response = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
+        if response.status_code == 200:
+            return {"categories": [html.unescape(c.get("name")) for c in response.json() if c.get("name") not in ["All", "Uncategorized"]]}
+        return {"error": "Failed to fetch categories"}
+    except Exception as e:
+        return {"error": str(e)}
+
+def create_order_and_payment_link(customer_name: str, phone: str, delivery_address: str, city: str, line_items: list) -> dict:
     """
-    Fetch the current status, total, and shipping notes of a specific order.
+    Creates a real pending order in WooCommerce and returns an error-free,
+    secure direct Paystack/WooCommerce payment URL.
+    line_items format: [{"product_id": 18376, "quantity": 1}]
+    """
+    endpoint = f"{STORE_URL}/wp-json/wc/v3/orders"
+    params = _get_auth_params()
+
+    first_name = customer_name.split()[0]
+    last_name = " ".join(customer_name.split()[1:]) if len(customer_name.split()) > 1 else ""
+
+    payload = {
+        "payment_method": "paystack",
+        "payment_method_title": "Debit Card / Bank Transfer (Paystack)",
+        "set_paid": False,
+        "billing": {
+            "first_name": first_name,
+            "last_name": last_name,
+            "address_1": delivery_address,
+            "city": city,
+            "country": "NG",
+            "phone": phone
+        },
+        "shipping": {
+            "first_name": first_name,
+            "last_name": last_name,
+            "address_1": delivery_address,
+            "city": city,
+            "country": "NG"
+        },
+        "line_items": line_items
+    }
+
+    try:
+        response = requests.post(endpoint, params=params, json=payload, headers=HEADERS, timeout=12)
+        if response.status_code in [200, 201]:
+            order = response.json()
+            order_id = order.get("id")
+            order_key = order.get("order_key")
+            total = order.get("total")
+
+            # Official WooCommerce direct Pay-for-Order link:
+            # When clicked, opens Paystack checkout cleanly on Malltiple with zero friction!
+            payment_url = f"{STORE_URL}/checkout/order-pay/{order_id}/?pay_for_order=true&key={order_key}"
+
+            return {
+                "success": True,
+                "order_id": order_id,
+                "total_naira": total,
+                "payment_url": payment_url,
+                "message": f"Order #{order_id} created for {total} Naira. Pay securely using the link."
+            }
+        return {"success": False, "error": f"Store returned status {response.status_code}: {response.text}"}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to create order: {str(e)}"}
+
+def track_order_live(order_id: int) -> dict:
+    """
+    Checks order fulfillment status and pulls courier/rider tracking notes.
     """
     endpoint = f"{STORE_URL}/wp-json/wc/v3/orders/{order_id}"
     params = _get_auth_params()
@@ -72,83 +132,31 @@ def get_order_status(order_id: int) -> dict:
         response = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
         if response.status_code == 200:
             order = response.json()
+
+            # Also pull order notes to see if a courier/tracking link was added
+            notes_endpoint = f"{STORE_URL}/wp-json/wc/v3/orders/{order_id}/notes"
+            notes_res = requests.get(notes_endpoint, params=params, headers=HEADERS, timeout=8)
+            dispatch_notes = []
+            if notes_res.status_code == 200:
+                for n in notes_res.json():
+                    if n.get("customer_note"):
+                        dispatch_notes.append(n.get("note"))
+
             return {
                 "found": True,
                 "order_id": order.get("id"),
                 "status": order.get("status"),
                 "total_naira": order.get("total"),
-                "date_created": order.get("date_created"),
-                "items": [item.get("name") for item in order.get("line_items", [])]
+                "date_created": order.get("date_created", "")[:10],
+                "shipping_city": order.get("shipping", {}).get("city", "N/A"),
+                "items": [f"{i.get('name')} (x{i.get('quantity')})" for i in order.get("line_items", [])],
+                "dispatch_updates": dispatch_notes if dispatch_notes else ["Order is being processed at the warehouse."]
             }
         elif response.status_code == 404:
-            return {"found": False, "message": f"Order #{order_id} does not exist."}
-        else:
-            return {"error": f"Store returned status code {response.status_code}"}
+            return {"found": False, "message": f"Order #{order_id} not found."}
+        return {"found": False, "error": f"Status {response.status_code}"}
     except Exception as e:
-        return {"error": f"Failed to get order status: {str(e)}"}
+        return {"found": False, "error": str(e)}
 
-def get_categories() -> dict:
-    """
-    Fetch all active product categories available on Malltiple.
-    """
-    endpoint = f"{STORE_URL}/wp-json/wc/v3/products/categories"
-    params = _get_auth_params({"per_page": 25, "hide_empty": True})
-
-    try:
-        response = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
-        if response.status_code == 200:
-            categories = response.json()
-            cat_list = [c.get("name") for c in categories if c.get("name") != "Uncategorized"]
-            return {"categories": cat_list}
-        return {"error": f"Failed to fetch categories: {response.status_code}"}
-    except Exception as e:
-        return {"error": f"Category fetch error: {str(e)}"}
-
-def find_customer_in_woocommerce(identifier: str) -> dict:
-    """
-    Search live WooCommerce orders by email or phone number to retrieve
-    real customer billing details and past order history.
-    """
-    clean_id = str(identifier).strip()
-    endpoint = f"{STORE_URL}/wp-json/wc/v3/orders"
-    params = _get_auth_params({"search": clean_id, "per_page": 3})
-
-    try:
-        response = requests.get(endpoint, params=params, headers=HEADERS, timeout=8)
-        if response.status_code == 200:
-            orders = response.json()
-            if not orders:
-                return {"found": False, "message": f"No past orders found in store for '{clean_id}'."}
-
-            # Extract customer profile from their most recent order
-            latest_order = orders[0]
-            billing = latest_order.get("billing", {})
-            first_name = billing.get("first_name", "")
-            last_name = billing.get("last_name", "")
-            full_name = f"{first_name} {last_name}".strip() or "Valued Customer"
-            city = billing.get("city", "")
-            phone = billing.get("phone", "")
-            email = billing.get("email", "")
-
-            # Compile recent order summaries
-            order_history = []
-            for o in orders:
-                order_history.append({
-                    "order_id": o.get("id"),
-                    "status": o.get("status"),
-                    "total_naira": o.get("total"),
-                    "date": o.get("date_created", "")[:10]
-                })
-
-            return {
-                "found": True,
-                "name": full_name,
-                "phone": phone,
-                "email": email,
-                "city": city,
-                "last_order_id": latest_order.get("id"),
-                "order_history": order_history
-            }
-        return {"found": False, "error": f"WooCommerce returned status {response.status_code}"}
-    except Exception as e:
-        return {"found": False, "error": f"Search error: {str(e)}"}
+# Backward compatibility alias
+get_order_status = track_order_live
