@@ -1,8 +1,14 @@
 import json
 from groq import Groq
 from app.core.config import settings
-from app.services.woocommerce import search_products, get_categories, track_order_live
-from app.services.cart_service import add_product_to_cart, view_customer_cart, clear_customer_cart
+from app.services.woocommerce import (
+    search_products, get_categories, track_order_live, 
+    find_or_create_wc_customer
+)
+from app.services.cart_service import (
+    add_product_to_cart, remove_product_from_cart, 
+    view_customer_cart, clear_customer_cart
+)
 from app.services.customer_service import link_customer_identity
 
 client = Groq(api_key=settings.GROQ_API_KEY)
@@ -12,10 +18,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_products",
-            "description": "Search products in catalog by 1-2 core keywords. ALWAYS call this first to get real product IDs.",
+            "description": "Search products in catalog. ALWAYS call this first to get the real product ID.",
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string", "description": "Search keyword"}},
+                "properties": {"query": {"type": "string", "description": "Keyword"}},
                 "required": ["query"]
             }
         }
@@ -23,13 +29,41 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "add_to_cart",
-            "description": "Add a product to the customer's personal shopping cart using its verified product_id.",
+            "name": "verify_customer_account",
+            "description": "Look up or link customer's Malltiple account by email or phone.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "product_id": {"type": "integer", "description": "Numeric product ID from search_products"},
-                    "quantity": {"type": "integer", "description": "Quantity to add", "default": 1}
+                    "email": {"type": "string", "description": "Customer email"},
+                    "phone": {"type": "string", "description": "Customer phone"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_to_cart",
+            "description": "Add a verified product ID to the customer's cart.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_id": {"type": "integer", "description": "Numeric product ID"},
+                    "quantity": {"type": "integer", "description": "Quantity", "default": 1}
+                },
+                "required": ["product_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_from_cart",
+            "description": "Remove a product from the customer's cart by its product ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_id": {"type": "integer", "description": "Product ID to remove"}
                 },
                 "required": ["product_id"]
             }
@@ -39,7 +73,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "view_cart",
-            "description": "View current shopping cart items, total in Naira, and direct checkout link.",
+            "description": "View current shopping cart items, total in Naira, and checkout link.",
             "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
@@ -49,22 +83,6 @@ TOOLS = [
             "name": "clear_cart",
             "description": "Clear all items from the customer's shopping cart.",
             "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_customer_details",
-            "description": "Remember the customer's name, phone, email, or delivery city.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "phone": {"type": "string"},
-                    "email": {"type": "string"},
-                    "city": {"type": "string"}
-                }
-            }
         }
     },
     {
@@ -102,32 +120,31 @@ TOOLS = [
 ]
 
 def build_system_prompt(customer_profile: dict) -> str:
-    cust_name = customer_profile.get("name") or "Valued Customer"
-    cust_phone = customer_profile.get("phone") or "Not provided"
-    cust_email = customer_profile.get("email") or "Not provided"
-    cust_city = customer_profile.get("city") or "Not provided"
+    has_account = customer_profile.get("has_profile", False)
+    cust_name = customer_profile.get("name") or "Customer"
+    cust_email = customer_profile.get("email") or "None"
+    cust_phone = customer_profile.get("phone") or "None"
 
     return f"""
-You are the official shopping assistant for Malltiple (malltiple.com.ng), a Nigerian marketplace.
+You are the official shopping assistant for Malltiple (malltiple.com.ng).
 
-CURRENT CUSTOMER PROFILE:
+CUSTOMER ACCOUNT STATUS:
+- Linked Account: {'YES' if has_account else 'NO'}
 - Name: {cust_name}
-- Phone: {cust_phone}
 - Email: {cust_email}
-- Location: {cust_city}
+- Phone: {cust_phone}
 
-CRITICAL SHOPPING & CART RULES:
-1. ALWAYS call `search_products` first when a customer asks for an item so you have the real `product_id`. NEVER guess a product ID.
-2. When the customer wants to add an item to their cart, call `add_to_cart(product_id, quantity)`.
-3. If the customer mentions their name, phone, or email, call `save_customer_details` to link their profile.
-4. When showing cart totals, provide the checkout link so they can tap and pay securely on Malltiple.
-
-CURRENCY & TONE:
-- Write all prices in Naira (e.g. '11,500 Naira', never 'N11,500').
-- If customer demands a human or reports a double debit, call `escalate_to_human`.
+SHOPPING & CART POLICY (STRICT):
+1. When a customer asks for a product, ALWAYS call `search_products` first to get the verified product ID and live price in Naira.
+2. If the customer wants to add an item to their cart, and their account is NOT linked (no email/phone):
+   - Politely ask for their email address or phone number: "To save items to your Malltiple account, what is your email or phone number?"
+   - Once they provide it, call `verify_customer_account(email, phone)` then immediately call `add_to_cart`.
+3. If they ask to remove an item, call `remove_from_cart(product_id)`.
+4. If they ask to see their cart, call `view_cart`.
+5. Keep answers concise, helpful, and speak all prices in Naira (e.g. '11,500 Naira').
 """
 
-def execute_turn(telegram_id: str, customer_profile: dict, history: list) -> tuple:
+def execute_turn(customer_key: str, customer_profile: dict, history: list) -> tuple:
     system_prompt = build_system_prompt(customer_profile)
     messages = [{"role": "system", "content": system_prompt}] + history[-6:]
     escalated = False
@@ -144,7 +161,7 @@ def execute_turn(telegram_id: str, customer_profile: dict, history: list) -> tup
                 max_tokens=400
             )
         except Exception:
-            return "Sorry, I had a brief connection glitch. Could you repeat that?", False, ""
+            return "Sorry, I had a brief connection issue. Could you repeat that?", False, ""
 
         msg = res.choices[0].message
         if msg.tool_calls:
@@ -164,27 +181,30 @@ def execute_turn(telegram_id: str, customer_profile: dict, history: list) -> tup
 
                 if fn == "search_products":
                     result = search_products(args.get("query", ""))
-                elif fn == "add_to_cart":
-                    result = add_product_to_cart(
-                        customer_id=telegram_id, 
-                        product_id=args.get("product_id"), 
-                        quantity=args.get("quantity", 1),
-                        customer_phone=customer_profile.get("phone", "")
-                    )
-                elif fn == "view_cart":
-                    result = view_customer_cart(telegram_id, customer_profile.get("phone", ""))
-                elif fn == "clear_cart":
-                    result = clear_customer_cart(telegram_id)
-                elif fn == "save_customer_details":
-                    result = link_customer_identity(
-                        telegram_id=telegram_id,
-                        name=args.get("name"),
-                        phone=args.get("phone"),
+                elif fn == "verify_customer_account":
+                    result = find_or_create_wc_customer(
                         email=args.get("email"),
-                        city=args.get("city")
+                        phone=args.get("phone"),
+                        name=customer_profile.get("name", "Customer")
                     )
-                    # Update active profile in place
-                    customer_profile.update(result)
+                    if result.get("found"):
+                        link_customer_identity(
+                            telegram_id=customer_key,
+                            name=result.get("name"),
+                            phone=result.get("phone"),
+                            email=result.get("email"),
+                            city=result.get("city")
+                        )
+                        customer_profile["has_profile"] = True
+                        customer_profile.update(result)
+                elif fn == "add_to_cart":
+                    result = add_product_to_cart(customer_key, args.get("product_id"), args.get("quantity", 1))
+                elif fn == "remove_from_cart":
+                    result = remove_product_from_cart(customer_key, args.get("product_id"))
+                elif fn == "view_cart":
+                    result = view_customer_cart(customer_key)
+                elif fn == "clear_cart":
+                    result = clear_customer_cart(customer_key)
                 elif fn == "track_order_live":
                     result = track_order_live(args.get("order_id", 0))
                 elif fn == "get_categories":
