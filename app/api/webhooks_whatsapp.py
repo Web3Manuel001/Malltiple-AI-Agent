@@ -1,6 +1,7 @@
 import html
+import asyncio
 import logging
-from fastapi import APIRouter, Form, Response, Request
+from fastapi import APIRouter, Form, Response
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.audit import AuditLog
@@ -18,11 +19,6 @@ async def handle_twilio_whatsapp(
     Body: str = Form(""),
     ProfileName: str = Form("WhatsApp Customer")
 ):
-    """
-    Receives incoming WhatsApp messages from Twilio Sandbox, 
-    processes them through the AI Brain, and replies via TwiML.
-    """
-    # Extract phone: 'whatsapp:+2348012345678' -> '2348012345678'
     clean_phone = From.replace("whatsapp:", "").replace("+", "").strip()
     user_text = Body.strip()
 
@@ -33,7 +29,6 @@ async def handle_twilio_whatsapp(
     db.add(AuditLog(user_id=clean_phone, user_name=ProfileName, sender="WhatsApp Customer", message=user_text))
     db.commit()
 
-    # Automatically identify customer by their real WhatsApp phone number
     customer_profile = get_or_create_customer(telegram_id=f"wa_{clean_phone}", fallback_name=ProfileName)
     if not customer_profile.get("phone"):
         customer_profile["phone"] = clean_phone
@@ -41,8 +36,10 @@ async def handle_twilio_whatsapp(
     session = WHATSAPP_SESSIONS.setdefault(clean_phone, {"history": []})
     session["history"].append({"role": "user", "content": user_text})
 
-    # Run AI Brain
-    reply, was_escalated, reason = execute_turn(clean_phone, customer_profile, session["history"])
+    # CRITICAL FIX: Run in worker thread so FastAPI event loop never freezes!
+    reply, was_escalated, reason = await asyncio.to_thread(
+        execute_turn, clean_phone, customer_profile, session["history"]
+    )
 
     if reply:
         session["history"].append({"role": "assistant", "content": reply})
@@ -54,7 +51,6 @@ async def handle_twilio_whatsapp(
 
     db.close()
 
-    # Format TwiML response to send back to customer's WhatsApp
     twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Message>{html.escape(reply)}</Message>

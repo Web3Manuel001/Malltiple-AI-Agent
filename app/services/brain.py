@@ -1,4 +1,5 @@
 import json
+import logging
 from groq import Groq
 from app.core.config import settings
 from app.services.woocommerce import (
@@ -11,6 +12,7 @@ from app.services.cart_service import (
 )
 from app.services.customer_service import link_customer_identity
 
+logger = logging.getLogger("brain")
 client = Groq(api_key=settings.GROQ_API_KEY)
 
 TOOLS = [
@@ -18,7 +20,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_products",
-            "description": "Search products in catalog. ALWAYS call this first to get the real product ID.",
+            "description": "Search products in catalog. Call this first to get verified product ID.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Keyword"}},
@@ -34,8 +36,8 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "email": {"type": "string", "description": "Customer email"},
-                    "phone": {"type": "string", "description": "Customer phone"}
+                    "email": {"type": "string"},
+                    "phone": {"type": "string"}
                 }
             }
         }
@@ -48,8 +50,8 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "product_id": {"type": "integer", "description": "Numeric product ID"},
-                    "quantity": {"type": "integer", "description": "Quantity", "default": 1}
+                    "product_id": {"type": "integer"},
+                    "quantity": {"type": "integer", "default": 1}
                 },
                 "required": ["product_id"]
             }
@@ -63,7 +65,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "product_id": {"type": "integer", "description": "Product ID to remove"}
+                    "product_id": {"type": "integer"}
                 },
                 "required": ["product_id"]
             }
@@ -126,31 +128,31 @@ def build_system_prompt(customer_profile: dict) -> str:
     cust_phone = customer_profile.get("phone") or "None"
 
     return f"""
-You are the official shopping assistant for Malltiple (malltiple.com.ng).
+You are the customer assistant for Malltiple (malltiple.com.ng).
 
-CUSTOMER ACCOUNT STATUS:
+CUSTOMER:
 - Linked Account: {'YES' if has_account else 'NO'}
 - Name: {cust_name}
 - Email: {cust_email}
 - Phone: {cust_phone}
 
-SHOPPING & CART POLICY (STRICT):
-1. When a customer asks for a product, ALWAYS call `search_products` first to get the verified product ID and live price in Naira.
-2. If the customer wants to add an item to their cart, and their account is NOT linked (no email/phone):
-   - Politely ask for their email address or phone number: "To save items to your Malltiple account, what is your email or phone number?"
-   - Once they provide it, call `verify_customer_account(email, phone)` then immediately call `add_to_cart`.
-3. If they ask to remove an item, call `remove_from_cart(product_id)`.
+RULES:
+1. When asked for an item, call `search_products` first to get the verified product ID.
+2. If customer wants to add an item to their cart and account is NOT linked, ask for email or phone.
+3. If they ask to remove an item, call `remove_from_cart`.
 4. If they ask to see their cart, call `view_cart`.
-5. Keep answers concise, helpful, and speak all prices in Naira (e.g. '11,500 Naira').
+5. Write all prices in Naira (e.g. '11,500 Naira', never 'N11,500'). Keep responses short and fast.
 """
 
 def execute_turn(customer_key: str, customer_profile: dict, history: list) -> tuple:
     system_prompt = build_system_prompt(customer_profile)
-    messages = [{"role": "system", "content": system_prompt}] + history[-6:]
+    messages = [{"role": "system", "content": system_prompt}] + history[-4:] # Keep last 4 for speed
     escalated = False
     reason = ""
+    iterations = 0
 
-    while True:
+    while iterations < 3: # HARD CAP: Max 3 tool iterations per turn
+        iterations += 1
         try:
             res = client.chat.completions.create(
                 model="qwen/qwen3.8-27b",
@@ -158,10 +160,11 @@ def execute_turn(customer_key: str, customer_profile: dict, history: list) -> tu
                 tools=TOOLS,
                 tool_choice="auto",
                 temperature=0.2,
-                max_tokens=400
+                max_tokens=300
             )
-        except Exception:
-            return "Sorry, I had a brief connection issue. Could you repeat that?", False, ""
+        except Exception as e:
+            logger.error(f"Groq error: {e}")
+            return "Sorry, I had a brief connection glitch. Could you repeat that?", False, ""
 
         msg = res.choices[0].message
         if msg.tool_calls:
@@ -220,3 +223,5 @@ def execute_turn(customer_key: str, customer_profile: dict, history: list) -> tu
             continue
         else:
             return msg.content or "", escalated, reason
+
+    return "I found the details for your items. How would you like to proceed?", False, ""

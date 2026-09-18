@@ -1,5 +1,6 @@
 import io
 import json
+import asyncio
 from datetime import datetime
 from fastapi import APIRouter, Request, BackgroundTasks
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -176,7 +177,6 @@ async def customer_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.commit()
     db.close()
 
-    # Retrieve customer identity from database
     customer_profile = get_or_create_customer(str(user_id), user_name)
 
     session = USER_SESSIONS.setdefault(user_id, {"history": [], "escalated": False, "assigned_to": None, "name": user_name})
@@ -190,9 +190,11 @@ async def customer_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     session["history"].append({"role": "user", "content": text})
-    
-    # Execute AI with full customer profile context!
-    reply, was_escalated, reason = execute_turn(str(user_id), customer_profile, session["history"])
+
+    # CRITICAL FIX: Run in worker thread!
+    reply, was_escalated, reason = await asyncio.to_thread(
+        execute_turn, str(user_id), customer_profile, session["history"]
+    )
 
     if reply:
         session["history"].append({"role": "assistant", "content": reply})
@@ -208,14 +210,6 @@ async def customer_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alert = f"🚨 *ESCALATION:*\n• Cust: {user_name} (`{user_id}`)\n• Reason: {reason}\n👉 Claim: `/claim {user_id}`"
         if settings.ADMIN_CHAT_ID:
             await context.bot.send_message(chat_id=settings.ADMIN_CHAT_ID, text=alert, parse_mode="Markdown")
-        
-        db = SessionLocal()
-        agents = db.query(Agent).filter(Agent.is_active == True).all()
-        for a in agents:
-            if str(a.telegram_id) != str(settings.ADMIN_CHAT_ID):
-                try: await context.bot.send_message(chat_id=a.telegram_id, text=alert, parse_mode="Markdown")
-                except: pass
-        db.close()
 
 async def customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -226,7 +220,9 @@ async def customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         v_file = await context.bot.get_file(update.message.voice.file_id)
         audio = bytes(await v_file.download_as_bytearray())
-        stt = transcribe_audio_bytes(audio)
+
+        # 1. Transcribe in thread
+        stt = await asyncio.to_thread(transcribe_audio_bytes, audio)
         if not stt.get("success") or not stt.get("text"):
             await update.message.reply_text("🎙️ I couldn't hear that clearly. Please try again.")
             return
@@ -236,18 +232,27 @@ async def customer_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         session = USER_SESSIONS.setdefault(user_id, {"history": [], "escalated": False, "assigned_to": None, "name": user_name})
         session["history"].append({"role": "user", "content": text})
-        reply, was_esc, reason = execute_turn(str(user_id), customer_profile, session["history"])
+
+        # 2. AI Brain in thread
+        reply, was_esc, reason = await asyncio.to_thread(
+            execute_turn, str(user_id), customer_profile, session["history"]
+        )
+
         if reply:
             session["history"].append({"role": "assistant", "content": reply})
+            # 3. TTS with explicit error print
             try:
-                tts = text_to_speech_bytes(reply)
+                tts = await asyncio.to_thread(text_to_speech_bytes, reply)
                 v_io = io.BytesIO(tts)
                 v_io.name = "reply.mp3"
                 await update.message.reply_voice(voice=v_io, caption=reply)
-            except:
+            except Exception as tts_err:
+                print(f"❌ [TTS ERROR]: {tts_err}")
                 await update.message.reply_text(reply)
+
     except Exception as e:
-        print(f"Voice error: {e}")
+        print(f"❌ [VOICE PIPELINE ERROR]: {e}")
+        await update.message.reply_text("⚠️ An error occurred processing your voice. Please try typing.")
 
 tg_app.add_handler(CommandHandler("claim", claim_cmd))
 tg_app.add_handler(CommandHandler("reply", reply_cmd))
