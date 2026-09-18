@@ -10,6 +10,148 @@ def get_auth_params():
         "consumer_secret": settings.CONSUMER_SECRET
     }
 
+def normalize_nigerian_phone(phone: str) -> list:
+    """
+    Extracts Nigerian phone variations (0903..., 234903..., 903...)
+    so searches never fail due to country code differences.
+    """
+    clean = ''.join(filter(str.isdigit, str(phone)))
+    if len(clean) >= 10:
+        last10 = clean[-10:]
+        return [f"0{last10}", f"234{last10}", last10]
+    return [clean] if clean else []
+
+def find_or_create_wc_customer(email: str = None, phone: str = None, name: str = "Customer") -> dict:
+    """
+    Searches WooCommerce for an existing customer account by email or phone.
+    Works for both registered accounts and past orders.
+    """
+    clean_email = (email or "").strip().lower()
+    phone_variants = normalize_nigerian_phone(phone) if phone else []
+
+    # 1. Search WooCommerce Registered Customers by Email (using ?search=)
+    if clean_email:
+        res = requests.get(
+            f"{settings.STORE_URL}/wp-json/wc/v3/customers",
+            params={**get_auth_params(), "search": clean_email, "role": "all"},
+            headers=HEADERS,
+            timeout=8
+        )
+        if res.status_code == 200 and res.json():
+            for cust in res.json():
+                if cust.get("email", "").lower() == clean_email:
+                    return {
+                        "found": True,
+                        "customer_id": cust.get("id"),
+                        "name": f"{cust.get('first_name', '')} {cust.get('last_name', '')}".strip() or name,
+                        "email": cust.get("email"),
+                        "phone": cust.get("billing", {}).get("phone") or (phone_variants[0] if phone_variants else ""),
+                        "city": cust.get("billing", {}).get("city", "")
+                    }
+
+    # 2. Search Orders by Email or Phone Variants
+    search_queries = ([clean_email] if clean_email else []) + phone_variants
+    for query in search_queries:
+        res = requests.get(
+            f"{settings.STORE_URL}/wp-json/wc/v3/orders",
+            params={**get_auth_params(), "search": query, "per_page": 1},
+            headers=HEADERS,
+            timeout=8
+        )
+        if res.status_code == 200 and res.json():
+            order = res.json()[0]
+            billing = order.get("billing", {})
+            return {
+                "found": True,
+                "customer_id": order.get("customer_id") or None,
+                "name": f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip() or name,
+                "email": billing.get("email") or clean_email,
+                "phone": billing.get("phone") or (phone_variants[0] if phone_variants else ""),
+                "city": billing.get("city", "")
+            }
+
+    # 3. If customer provided email but has no account, register them automatically
+    if clean_email:
+        first_name = name.split()[0] if name else "Customer"
+        last_name = " ".join(name.split()[1:]) if len(name.split()) > 1 else ""
+        payload = {
+            "email": clean_email,
+            "first_name": first_name,
+            "last_name": last_name,
+            "billing": {
+                "first_name": first_name,
+                "last_name": last_name,
+                "email": clean_email,
+                "phone": phone_variants[0] if phone_variants else ""
+            }
+        }
+        res = requests.post(f"{settings.STORE_URL}/wp-json/wc/v3/customers", params=get_auth_params(), json=payload, headers=HEADERS, timeout=8)
+        if res.status_code in [200, 201]:
+            cust = res.json()
+            return {
+                "found": True,
+                "customer_id": cust.get("id"),
+                "name": name,
+                "email": clean_email,
+                "phone": phone_variants[0] if phone_variants else "",
+                "city": ""
+            }
+
+    return {"found": False, "message": "No account found. Please provide your email address to link your Malltiple account."}
+
+def create_account_order(customer_id: int, line_items: list, customer_data: dict) -> dict:
+    """
+    Creates a pending order ASSIGNED DIRECTLY to the customer's account.
+    This ensures it appears in their Malltiple app and website under 'My Account' -> 'Orders'!
+    """
+    endpoint = f"{settings.STORE_URL}/wp-json/wc/v3/orders"
+    params = get_auth_params()
+
+    first_name = customer_data.get("name", "Customer").split()[0]
+    last_name = " ".join(customer_data.get("name", "").split()[1:])
+
+    payload = {
+        "customer_id": customer_id or 0, # Links order directly to their Malltiple user account!
+        "payment_method": "paystack",
+        "payment_method_title": "Paystack (Card / Bank Transfer)",
+        "set_paid": False,
+        "status": "pending",
+        "billing": {
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": customer_data.get("email", ""),
+            "phone": customer_data.get("phone", ""),
+            "city": customer_data.get("city", "Lagos"),
+            "country": "NG"
+        },
+        "line_items": line_items
+    }
+
+    try:
+        res = requests.post(endpoint, params=params, json=payload, headers=HEADERS, timeout=10)
+        if res.status_code in [200, 201]:
+            order = res.json()
+            order_id = order.get("id")
+            total = order.get("total")
+            
+            # Use WooCommerce native payment link
+            pay_url = order.get("payment_url") or f"{settings.STORE_URL}/checkout/order-pay/{order_id}/?pay_for_order=true&key={order.get('order_key')}"
+
+            return {
+                "success": True,
+                "order_id": order_id,
+                "total_naira": total,
+                "payment_url": pay_url,
+                "message": (
+                    f"Order #{order_id} for {total} Naira has been added directly to your Malltiple account!\n\n"
+                    f"👉 You can view and pay for it right now in your Malltiple App/Site under 'My Account > Orders', "
+                    f"or pay directly with this link: {pay_url}"
+                )
+            }
+        return {"success": False, "error": f"Store returned status {res.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 def search_products(query: str, per_page: int = 4) -> dict:
     clean_query = query.strip()
     endpoint = f"{settings.STORE_URL}/wp-json/wc/v3/products"
@@ -53,8 +195,7 @@ def get_product_by_id(product_id: int) -> dict:
                 "id": p.get("id"),
                 "name": p.get("name"),
                 "price": float(p.get("price") or 0.0),
-                "in_stock": p.get("stock_status") == "instock",
-                "permalink": p.get("permalink")
+                "in_stock": p.get("stock_status") == "instock"
             }
         return {"found": False}
     except Exception:
@@ -70,68 +211,6 @@ def get_categories() -> dict:
         return {"error": "Failed to fetch categories"}
     except Exception as e:
         return {"error": str(e)}
-
-# --- ACCOUNT-LINKED CART OPERATIONS ---
-
-def find_or_create_wc_customer(email: str = None, phone: str = None, name: str = "Customer") -> dict:
-    """
-    Looks up customer account on WooCommerce by email or phone.
-    Creates an account if they don't have one yet.
-    """
-    clean_email = (email or "").strip().lower()
-    clean_phone = (phone or "").strip()
-
-    # 1. Search by email
-    if clean_email:
-        res = requests.get(f"{settings.STORE_URL}/wp-json/wc/v3/customers", params={**get_auth_params(), "email": clean_email}, headers=HEADERS, timeout=8)
-        if res.status_code == 200 and res.json():
-            cust = res.json()[0]
-            return {
-                "found": True,
-                "customer_id": cust.get("id"),
-                "name": f"{cust.get('first_name', '')} {cust.get('last_name', '')}".strip() or name,
-                "email": cust.get("email"),
-                "phone": cust.get("billing", {}).get("phone") or clean_phone,
-                "city": cust.get("billing", {}).get("city")
-            }
-
-    # 2. Search recent orders by phone if email wasn't provided
-    if clean_phone:
-        res = requests.get(f"{settings.STORE_URL}/wp-json/wc/v3/orders", params={**get_auth_params(), "search": clean_phone, "per_page": 1}, headers=HEADERS, timeout=8)
-        if res.status_code == 200 and res.json():
-            order = res.json()[0]
-            billing = order.get("billing", {})
-            return {
-                "found": True,
-                "customer_id": order.get("customer_id") or None,
-                "name": f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip() or name,
-                "email": billing.get("email") or clean_email,
-                "phone": billing.get("phone") or clean_phone,
-                "city": billing.get("city")
-            }
-
-    # 3. Create a new WooCommerce customer if not found
-    if clean_email:
-        first_name = name.split()[0]
-        last_name = " ".join(name.split()[1:]) if len(name.split()) > 1 else ""
-        payload = {
-            "email": clean_email,
-            "first_name": first_name,
-            "last_name": last_name,
-            "billing": {"first_name": first_name, "last_name": last_name, "phone": clean_phone, "email": clean_email}
-        }
-        res = requests.post(f"{settings.STORE_URL}/wp-json/wc/v3/customers", params=get_auth_params(), json=payload, headers=HEADERS, timeout=8)
-        if res.status_code in [200, 201]:
-            cust = res.json()
-            return {
-                "found": True,
-                "customer_id": cust.get("id"),
-                "name": name,
-                "email": clean_email,
-                "phone": clean_phone
-            }
-
-    return {"found": False, "message": "Please provide an email or phone number to access your account."}
 
 def track_order_live(order_id: int) -> dict:
     endpoint = f"{settings.STORE_URL}/wp-json/wc/v3/orders/{order_id}"
