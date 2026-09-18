@@ -9,24 +9,21 @@ from app.api.webhooks_whatsapp import router as whatsapp_router
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Create all tables on boot
 Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Initialize Telegram Bot & Set Webhook
+    # Startup Telegram webhook
     await tg_app.initialize()
     await tg_app.start()
-
     webhook_url = f"{settings.BASE_URL}/api/telegram-webhook"
     print(f"🔗 Registering Telegram Webhook to: {webhook_url}")
     await tg_app.bot.set_webhook(url=webhook_url)
 
-    print("🚀 Malltiple Enterprise Engine Online!")
+    print("🚀 Malltiple Enterprise Engine (Telegram + WhatsApp) Online!")
     yield
 
-    # Shutdown: Cleanly remove webhook
-    print("🛑 Shutting down Telegram Webhook...")
+    # Shutdown
     await tg_app.stop()
     await tg_app.shutdown()
 
@@ -34,9 +31,9 @@ app = FastAPI(title="Malltiple Enterprise AI Engine", lifespan=lifespan)
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "service": "Malltiple Modular Engine"}
+    return {"status": "healthy", "service": "Malltiple Engine"}
 
-# Mount Domain Routers
-app.include_router(dashboard_router) #Dashboard router is included for handling dashboard-related endpoints
-app.include_router(telegram_router) #Telegram router is included for handling Telegram webhooks and interactions
-app.include_router(whatsapp_router) #Whatsapp router is included for handling WhatsApp webhooks and interactions
+# Mount ALL Domain Routers
+app.include_router(dashboard_router)
+app.include_router(telegram_router)
+app.include_router(whatsapp_router)
